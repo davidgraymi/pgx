@@ -269,6 +269,40 @@ def evaluate(rng_key, my_model, baseline_model):
     return R
 
 
+def supervised_loss_fn(model_params, model_state, obs, target_actions):
+    """Computes pure categorical cross-entropy loss against expert actions."""
+    # Forward pass through your network
+    (logits, _), model_state = forward.apply(
+        model_params, model_state, obs, is_eval=False
+    )
+    
+    # Calculate cross entropy against the integer index of the expert move
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_actions)
+    loss = jnp.mean(loss)
+    
+    return loss, model_state
+
+
+@partial(jax.pmap, axis_name="i")
+def supervised_train_step(model, opt_state, obs, target_actions):
+    """A parallelized parameter update optimization step for supervised learning."""
+    model_params, model_state = model
+    
+    # Calculate gradients
+    grads, model_state = jax.grad(supervised_loss_fn, has_aux=True)(
+        model_params, model_state, obs, target_actions
+    )
+    
+    # Average gradients across your parallel accelerator execution cores
+    grads = jax.lax.pmean(grads, axis_name="i")
+    
+    # Apply standard optimizer updates
+    updates, opt_state = optimizer.update(grads, opt_state)
+    model_params = optax.apply_updates(model_params, updates)
+    
+    return (model_params, model_state), opt_state, grads
+
+
 if __name__ == "__main__":
     wandb.init(project="pgx-chess-muzero", config=config.model_dump())
 
@@ -277,15 +311,66 @@ if __name__ == "__main__":
     dummy_input = dummy_state.observation
     model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
     opt_state = optimizer.init(params=model[0])
-    
-    # --- OPTIONAL: Load Supervised Learning weights if they exist ---
-    # TODO: optionally load the latest weights
+
+    # =========================================================================
+    # OPTIONAL SUPERVISED PRE-TRAINING STEP
+    # =========================================================================
+    sl_dataset_path = os.path.join("checkpoints", "sl_dataset.pkl")
     sl_weights = os.path.join("checkpoints", "sl_weights.pkl")
-    if os.path.exists(sl_weights):
-        print("Found supervised checkpoint! Loading weights...")
+    
+    if os.path.exists(sl_dataset_path) and not os.path.exists(sl_weights):
+        print(">>> Found expert dataset! Commencing Supervised Pre-Training...")
+        with open(sl_dataset_path, "rb") as f:
+            # Expects a dict containing 'observations' and 'actions' arrays
+            dataset = pickle.load(f)
+            
+        sl_obs = jnp.array(dataset["observations"])
+        sl_actions = jnp.array(dataset["actions"])
+        
+        # Simple mini-batch loop parameters for SL profiling
+        sl_epochs = 5
+        sl_batch_size = config.training_batch_size
+        num_samples = sl_obs.shape[0]
+        num_batches = num_samples // sl_batch_size
+        
+        # Temporarily shard the states onto active cores for the optimization step
+        sl_model = jax.tree_util.tree_map(
+            lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
+        )
+        sl_opt_state = jax.tree_util.tree_map(
+            lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
+        )
+        
+        for epoch in range(sl_epochs):
+            epoch_loss = 0.0
+            for b in range(num_batches):
+                start_idx = b * sl_batch_size
+                end_idx = start_idx + sl_batch_size
+                
+                # Slice and reshape chunks to split evenly among your pmap device cores
+                b_obs = sl_obs[start_idx:end_idx].reshape((num_devices, -1) + sl_obs.shape[1:])
+                b_act = sl_actions[start_idx:end_idx].reshape((num_devices, -1))
+                
+                sl_model, sl_opt_state, _ = supervised_train_step(
+                    sl_model, sl_opt_state, b_obs, b_act
+                )
+            print(f"Supervised Epoch {epoch+1}/{sl_epochs} completed.")
+            
+        # Unwrap parameters back to CPU configurations
+        model = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], sl_model))
+        opt_state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], sl_opt_state))
+        
+        # Save structural checkpoint so this phase can be skipped on future runs
+        with open(sl_weights, "wb") as f:
+            pickle.dump(model, f)
+        print(f">>> Supervised training complete. Weights exported to {sl_weights}")
+    
+    # --- Fallback: Optionally load already compiled weights ---
+    elif os.path.exists(sl_weights):
+        print("Found supervised checkpoint! Skipping optimization loop and loading weights...")
         with open(sl_weights, "rb") as f:
-            model_params, model_state = pickle.load(f)
-            model = (model_params, model_state)
+            model = pickle.load(f)
+            opt_state = optimizer.init(params=model[0])
 
     # Track the raw un-replicated CPU parameter formats for on-demand evaluation swapping
     # This keeps our memory consumption footprint isolated strictly to host CPU RAM

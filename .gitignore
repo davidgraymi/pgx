@@ -15,3 +15,4 @@ wandb
 checkpoints
 __pycache__
 tests/assets/*/*.svg
+data
