@@ -21,9 +21,11 @@ from typing import NamedTuple
 from pydantic import ConfigDict
 import shutil
 
+import numpy as np
 import haiku as hk
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import mctx
 import optax
 import pgx
@@ -36,6 +38,10 @@ from network import AZNet
 
 devices = jax.local_devices()
 num_devices = len(devices)
+# 1. Create a 1D grid representation of your accelerator devices
+mesh = Mesh(np.array(devices), axis_names=("devices",))
+# 2. Tell JAX to shard across the newly stacked leading axis (axis 0)
+sharding = NamedSharding(mesh, P("devices"))
 
 
 class Config(BaseModel):
@@ -267,20 +273,11 @@ def evaluate(rng_key, my_model, baseline_model):
 if __name__ == "__main__":
     wandb.init(project="pgx-chess-muzero", config=config.model_dump())
 
-    # Prepare checkpoint dir
-    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-    now = now.strftime("%Y%m%d%H%M%S")
-    ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    
-    rng_key = jax.random.PRNGKey(config.seed)
-    rng_key, subkey = jax.random.split(rng_key)
-    
-    # Initialize networks
-    init_state = jax.vmap(env.init)(jax.random.split(subkey, num_devices))
-    model_params, model_state = forward.init(
-        jax.random.split(subkey, num_devices), init_state.observation, is_eval=False
-    )
+    # Initialize model and opt_state
+    dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
+    dummy_input = dummy_state.observation
+    model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
+    opt_state = optimizer.init(params=model[0])
     
     # --- OPTIONAL: Load Supervised Learning weights if they exist ---
     # TODO: optionally load the latest weights
@@ -289,14 +286,20 @@ if __name__ == "__main__":
         print("Found supervised checkpoint! Loading weights...")
         with open(sl_weights, "rb") as f:
             model_params, model_state = pickle.load(f)
-
-    model = (model_params, model_state)
-    opt_state = optimizer.init(model_params)
-    model, opt_state = jax.device_put_replicated((model, opt_state), devices)
+            model = (model_params, model_state)
     
-    # Replicate model variables across local accelerator devices
-    model = jax.device_put_replicated(model, devices)
-    opt_state = jax.device_put_replicated(opt_state, devices)
+    model = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
+    )
+    opt_state = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
+    )
+
+    # Prepare checkpoint dir
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    now = now.strftime("%Y%m%d%H%M%S")
+    ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
+    os.makedirs(ckpt_dir, exist_ok=True)
     
     # Establish our starting baseline evaluator snapshot from our current network weights
     baseline_model = jax.tree_util.tree_map(lambda x: jnp.copy(x), model)
@@ -307,7 +310,10 @@ if __name__ == "__main__":
     if os.path.exists(base_weights):
         print("Found baseline checkpoint! Loading weights...")
         with open(base_weights, "rb") as f:
-            baseline_model = pickle.load(f)
+            loaded_base = pickle.load(f)
+            baseline_model = jax.tree_util.tree_map(
+                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), loaded_base
+            )
 
     # Initialize logging dict
     iteration: int = 0
@@ -315,6 +321,7 @@ if __name__ == "__main__":
     frames: int = 0
     metrics = {"iteration": 0, "hours": hours, "frames": frames}
 
+    rng_key = jax.random.PRNGKey(config.seed)
     while True:
         # Evaluation
         if iteration % config.eval_interval == 0:
