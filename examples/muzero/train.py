@@ -19,7 +19,6 @@ import time
 from functools import partial
 from typing import NamedTuple
 from pydantic import ConfigDict
-import shutil
 
 import numpy as np
 import haiku as hk
@@ -53,11 +52,11 @@ class Config(BaseModel):
     num_layers: int = 6
     resnet_v2: bool = True
     # selfplay params
-    selfplay_batch_size: int = 1024
-    num_simulations: int = 32
-    max_num_steps: int = 256
+    selfplay_batch_size: int = 64
+    num_simulations: int = 16
+    max_num_steps: int = 128
     # training params
-    training_batch_size: int = 4096
+    training_batch_size: int = 2048
     learning_rate: float = 0.001
     # eval params
     eval_interval: int = 5
@@ -287,7 +286,20 @@ if __name__ == "__main__":
         with open(sl_weights, "rb") as f:
             model_params, model_state = pickle.load(f)
             model = (model_params, model_state)
-    
+
+    # Track the raw un-replicated CPU parameter formats for on-demand evaluation swapping
+    # This keeps our memory consumption footprint isolated strictly to host CPU RAM
+    baseline_model_cpu = jax.device_get(model)
+
+    # --- OPTIONAL: Load baseline weights if they exist ---
+    # TODO: optionally load the latest weights
+    base_weights = os.path.join("checkpoints", "base_weights.pkl")
+    if os.path.exists(base_weights):
+        print("Found baseline checkpoint! Loading weights...")
+        with open(base_weights, "rb") as f:
+            baseline_model_cpu = pickle.load(f)
+
+    # Replicate only our active training model and opt_state variables across devices
     model = jax.tree_util.tree_map(
         lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
     )
@@ -300,20 +312,6 @@ if __name__ == "__main__":
     now = now.strftime("%Y%m%d%H%M%S")
     ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
     os.makedirs(ckpt_dir, exist_ok=True)
-    
-    # Establish our starting baseline evaluator snapshot from our current network weights
-    baseline_model = jax.tree_util.tree_map(lambda x: jnp.copy(x), model)
-
-    # --- OPTIONAL: Load baseline weights if they exist ---
-    # TODO: optionally load the latest weights
-    base_weights = os.path.join("checkpoints", "base_weights.pkl")
-    if os.path.exists(base_weights):
-        print("Found baseline checkpoint! Loading weights...")
-        with open(base_weights, "rb") as f:
-            loaded_base = pickle.load(f)
-            baseline_model = jax.tree_util.tree_map(
-                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), loaded_base
-            )
 
     # Initialize logging dict
     iteration: int = 0
@@ -327,7 +325,18 @@ if __name__ == "__main__":
         if iteration % config.eval_interval == 0:
             rng_key, eval_key = jax.random.split(rng_key)
             keys = jax.random.split(eval_key, num_devices)
-            R = evaluate(keys, model, baseline_model)
+
+            # 1. Temporarily mirror the baseline weights to matching multi-device sharded layouts 
+            # only for the duration of this evaluation window.
+            baseline_model_sharded = jax.tree_util.tree_map(
+                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), baseline_model_cpu
+            )
+
+            # 2. Execute the evaluation steps
+            R = evaluate(keys, model, baseline_model_sharded)
+
+            # 3. Explicitly delete the sharded reference to instantly clear VRAM allocations
+            del baseline_model_sharded
 
             win_rate = ((R == 1).sum() / R.size).item()
             draw_rate = ((R == 0).sum() / R.size).item()
@@ -345,11 +354,14 @@ if __name__ == "__main__":
             # Store checkpoints
             model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
             chpt_0 = os.path.join(ckpt_dir, f"{iteration:06d}.ckpt")
+
+            cpu_model_snapshot = jax.device_get(model_0)
+
             with open(chpt_0, "wb") as f:
                 dic = {
                     "config": config,
                     "rng_key": rng_key,
-                    "model": jax.device_get(model_0),
+                    "model": cpu_model_snapshot,
                     "opt_state": jax.device_get(opt_state_0),
                     "iteration": iteration,
                     "frames": frames,
@@ -363,8 +375,9 @@ if __name__ == "__main__":
             # Upgrades the baseline when the network shows meaningful improvement
             if win_rate > 0.55:
                 print(">>> Model outperformed old baseline snapshot. Updating target model parameters.")
-                baseline_model = jax.tree_util.tree_map(lambda x: jnp.copy(x), model)
-                shutil.copy2(chpt_0, base_weights)
+                baseline_model_cpu = cpu_model_snapshot
+                with open(base_weights, "wb") as f:
+                    pickle.dump(baseline_model_cpu, f)
 
         print(metrics)
         wandb.log(metrics)
@@ -408,9 +421,9 @@ if __name__ == "__main__":
         hours += (et - st) / 3600
         metrics.update(
             {
-                "train/policy_loss": policy_loss,
-                "train/value_loss": value_loss,
                 "hours": hours,
                 "frames": frames,
+                "train/policy_loss": policy_loss,
+                "train/value_loss": value_loss,
             }
         )
