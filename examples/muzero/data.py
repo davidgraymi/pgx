@@ -1,4 +1,7 @@
 import os
+# Force JAX to use the CPU for this script to prevent GPU OOM warnings
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
 import urllib.request
 import pickle
 import pandas as pd
@@ -8,51 +11,38 @@ import pgx
 import jax
 
 def download_and_preprocess_xlsx(
-    url: str = "https://data.mendeley.com/public-files/datasets/m2wxzmhv6s/files/cf304182-cdb2-4004-8e6a-ea7335019539/file_downloaded",
+    url: str = "https://mendeley.com",
     xlsx_path: str = "data/chess_dataset.xlsx",
-    output_path: str = "data/sl_dataset.pkl",
+    output_path: str = "checkpoints/sl_dataset.pkl",
     max_positions: int = 100000,
     min_elo: int = 2000
 ):
-    """Downloads the spreadsheet and compiles board tensors from high-Elo master games."""
     os.makedirs("data", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
     
-    # -------------------------------------------------------------------------
-    # STEP 1: DATASET DOWNLOAD
-    # -------------------------------------------------------------------------
     if not os.path.exists(xlsx_path) and not os.path.exists(output_path):
-        print(f"Downloading Excel dataset from Mendeley: {url}")
-        try:
-            opener = urllib.request.build_opener()
-            opener.addheaders = [('User-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')]
-            urllib.request.install_opener(opener)
-            urllib.request.urlretrieve(url, xlsx_path)
-            print("Download complete.")
-        except Exception as e:
-            print(f"Network error: {e}. Please download file manually to '{xlsx_path}'")
-            return
+        print(" Downloading dataset file...")
+        opener = urllib.request.build_opener()
+        opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+        urllib.request.install_opener(opener)
+        urllib.request.urlretrieve(url, xlsx_path)
 
-    # -------------------------------------------------------------------------
-    # STEP 2: QUALITY FILTERING AND TENSOR EXTRACTION
-    # -------------------------------------------------------------------------
     if os.path.exists(output_path):
-        print(f"Processed target dataset already exists at {output_path}. Skipping.")
+        print("Dataset already compiled.")
         return
 
     print(f"Loading spreadsheet database: {xlsx_path}")
     target_cols = ['WhiteElo', 'BlackElo', 'Termination', 'Moves']
     df = pd.read_excel(xlsx_path, usecols=target_cols)
     
-    # Clean and cast rating data columns safely to numeric types
     df['WhiteElo'] = pd.to_numeric(df['WhiteElo'], errors='coerce')
     df['BlackElo'] = pd.to_numeric(df['BlackElo'], errors='coerce')
     
-    # Filter for high-quality games: Both players 2000+ Elo AND normal game finishes (no abandons)
-    quality_mask = (df['WhiteElo'] >= min_elo) & (df['BlackElo'] >= min_elo)
+    mask = (df['WhiteElo'] >= min_elo) & (df['BlackElo'] >= min_elo)
     if 'Termination' in df.columns:
-        quality_mask &= (df['Termination'].str.lower() != 'abandoned')
-
-    df_filtered = df[quality_mask].dropna(subset=['Moves'])
+        mask &= (df['Termination'].str.lower() != 'abandoned')
+        
+    df_filtered = df[mask].dropna(subset=['Moves'])
     print(f" Ready to process {len(df_filtered)} expert games.")
 
     env = pgx.make("chess")
@@ -72,6 +62,10 @@ def download_and_preprocess_xlsx(
             if total_positions >= max_positions:
                 break
                 
+            # FIX: Skip move numbers (e.g., "1.", "2...", "12") instead of breaking
+            if '.' in move_str or move_str.isdigit() or move_str == '*':
+                continue
+                
             try:
                 try:
                     move = py_board.parse_san(move_str)
@@ -80,6 +74,7 @@ def download_and_preprocess_xlsx(
                 
                 action_idx = env.action_names.index(move.uci())
             except Exception:
+                # If a specific move fails to parse, skip the remainder of THIS game
                 break
                 
             if not state.legal_action_mask[action_idx]:
@@ -94,7 +89,6 @@ def download_and_preprocess_xlsx(
             if state.terminated:
                 break
                 
-        # Status update every 10,000 positions
         if total_positions % 10000 == 0 and total_positions > 0:
             print(f" Progress: Gathered {total_positions}/{max_positions} positions...")
 
