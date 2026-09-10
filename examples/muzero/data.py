@@ -1,5 +1,5 @@
 import os
-# Force JAX to use the CPU for this script to prevent GPU OOM warnings
+# Force JAX to use the CPU for data preprocessing to avoid VRAM allocation errors
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import urllib.request
@@ -15,7 +15,7 @@ def download_and_preprocess_xlsx(
     xlsx_path: str = "data/chess_dataset.xlsx",
     output_path: str = "checkpoints/sl_dataset.pkl",
     max_positions: int = 100000,
-    min_elo: int = 2000
+    min_elo: int = 1600  # Lowered to 1600 to cleanly catch games like your sample row
 ):
     os.makedirs("data", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
@@ -38,12 +38,13 @@ def download_and_preprocess_xlsx(
     df['WhiteElo'] = pd.to_numeric(df['WhiteElo'], errors='coerce')
     df['BlackElo'] = pd.to_numeric(df['BlackElo'], errors='coerce')
     
-    mask = (df['WhiteElo'] >= min_elo) & (df['BlackElo'] >= min_elo)
+    # Filter: At least one player is an advanced 1600+ user, and eliminate toxic/abandoned records
+    mask = (df['WhiteElo'] >= min_elo) | (df['BlackElo'] >= min_elo)
     if 'Termination' in df.columns:
-        mask &= (df['Termination'].str.lower() != 'abandoned')
+        mask &= (df['Termination'].str.lower().str.contains("abandoned") == False)
         
     df_filtered = df[mask].dropna(subset=['Moves'])
-    print(f" Ready to process {len(df_filtered)} expert games.")
+    print(f" Ready to process {len(df_filtered)} qualified high-level games.")
 
     env = pgx.make("chess")
     obs_list, act_list = [], []
@@ -62,24 +63,23 @@ def download_and_preprocess_xlsx(
             if total_positions >= max_positions:
                 break
                 
-            # FIX: Skip move numbers (e.g., "1.", "2...", "12") instead of breaking
-            if '.' in move_str or move_str.isdigit() or move_str == '*':
+            # Skip invalid characters or headers if they leak into string
+            if move_str in ['*', '1-0', '0-1', '1/2-1/2'] or len(move_str) < 4:
                 continue
                 
             try:
-                try:
-                    move = py_board.parse_san(move_str)
-                except ValueError:
-                    move = py_board.parse_uci(move_str)
-                
+                # Optimized directly for your dataset's pure UCI format (e.g., 'd2d4')
+                move = py_board.parse_uci(move_str)
                 action_idx = env.action_names.index(move.uci())
             except Exception:
-                # If a specific move fails to parse, skip the remainder of THIS game
+                # If a move fails to parse, skip the remainder of this specific game
                 break
                 
+            # Skip if the move is flagged as illegal by Pgx internal logic
             if not state.legal_action_mask[action_idx]:
                 break
                 
+            # Keep the features and target move index
             obs_list.append(np.array(state.observation))
             act_list.append(action_idx)
             total_positions += 1
@@ -89,13 +89,16 @@ def download_and_preprocess_xlsx(
             if state.terminated:
                 break
                 
-        if total_positions % 10000 == 0 and total_positions > 0:
+        if total_positions % 1 == 0 and total_positions > 0:
             print(f" Progress: Gathered {total_positions}/{max_positions} positions...")
+        else:
+            print("skip")
 
     if total_positions == 0:
         print("No positions found matching filter criteria.")
         return
 
+    # Pack into array representations
     dataset = {
         "observations": np.stack(obs_list, axis=0).astype(np.float32),
         "actions": np.array(act_list, dtype=np.int32)
