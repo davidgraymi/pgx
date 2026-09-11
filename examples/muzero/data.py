@@ -105,7 +105,7 @@ def iter_training_games(pgn_path: str, min_elo: int):
 def download_and_preprocess(
     months=("2024-10",),
     data_dir: str = "data",
-    output_path: str = "checkpoints/sl_dataset.pkl",
+    output_path: str = "data/sl_dataset.pkl",
     max_positions: int = 100000,
     min_elo: int = 2200,
 ):

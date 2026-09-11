@@ -58,9 +58,12 @@ class Config(BaseModel):
     # training params
     training_batch_size: int = 2048
     learning_rate: float = 0.001
+    load_ckpt: str | None = None
+    training_mode: str = "rl"
     # eval params
     eval_interval: int = 5
     model_config = ConfigDict(extra="forbid")
+    champion: str | None = None
 
 
 conf_dict = OmegaConf.from_cli()
@@ -289,108 +292,23 @@ def supervised_train_step(model, opt_state, obs, target_actions):
     model_params, model_state = model
     
     # Calculate gradients
-    grads, model_state = jax.grad(supervised_loss_fn, has_aux=True)(
+    (loss, model_state), grads = jax.value_and_grad(supervised_loss_fn, has_aux=True)(
         model_params, model_state, obs, target_actions
     )
     
     # Average gradients across your parallel accelerator execution cores
     grads = jax.lax.pmean(grads, axis_name="i")
+    loss = jax.lax.pmean(loss, axis_name="i")
     
     # Apply standard optimizer updates
     updates, opt_state = optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
     
-    return (model_params, model_state), opt_state, grads
+    return (model_params, model_state), opt_state, loss
 
 
 if __name__ == "__main__":
     wandb.init(project="pgx-chess-muzero", config=config.model_dump())
-
-    # Initialize model and opt_state
-    dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
-    dummy_input = dummy_state.observation
-    model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
-    opt_state = optimizer.init(params=model[0])
-
-    # =========================================================================
-    # OPTIONAL SUPERVISED PRE-TRAINING STEP
-    # =========================================================================
-    sl_dataset_path = os.path.join("checkpoints", "sl_dataset.pkl")
-    sl_weights = os.path.join("checkpoints", "sl_weights.pkl")
-    
-    if os.path.exists(sl_dataset_path) and not os.path.exists(sl_weights):
-        print(">>> Found expert dataset! Commencing Supervised Pre-Training...")
-        with open(sl_dataset_path, "rb") as f:
-            # Expects a dict containing 'observations' and 'actions' arrays
-            dataset = pickle.load(f)
-            
-        sl_obs = jnp.array(dataset["observations"])
-        sl_actions = jnp.array(dataset["actions"])
-        
-        # Simple mini-batch loop parameters for SL profiling
-        sl_epochs = 5
-        sl_batch_size = config.training_batch_size
-        num_samples = sl_obs.shape[0]
-        num_batches = num_samples // sl_batch_size
-        
-        # Temporarily shard the states onto active cores for the optimization step
-        sl_model = jax.tree_util.tree_map(
-            lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
-        )
-        sl_opt_state = jax.tree_util.tree_map(
-            lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
-        )
-        
-        for epoch in range(sl_epochs):
-            epoch_loss = 0.0
-            for b in range(num_batches):
-                start_idx = b * sl_batch_size
-                end_idx = start_idx + sl_batch_size
-                
-                # Slice and reshape chunks to split evenly among your pmap device cores
-                b_obs = sl_obs[start_idx:end_idx].reshape((num_devices, -1) + sl_obs.shape[1:])
-                b_act = sl_actions[start_idx:end_idx].reshape((num_devices, -1))
-                
-                sl_model, sl_opt_state, _ = supervised_train_step(
-                    sl_model, sl_opt_state, b_obs, b_act
-                )
-            print(f"Supervised Epoch {epoch+1}/{sl_epochs} completed.")
-            
-        # Unwrap parameters back to CPU configurations
-        model = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], sl_model))
-        opt_state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], sl_opt_state))
-        
-        # Save structural checkpoint so this phase can be skipped on future runs
-        with open(sl_weights, "wb") as f:
-            pickle.dump(model, f)
-        print(f">>> Supervised training complete. Weights exported to {sl_weights}")
-    
-    # --- Fallback: Optionally load already compiled weights ---
-    elif os.path.exists(sl_weights):
-        print("Found supervised checkpoint! Skipping optimization loop and loading weights...")
-        with open(sl_weights, "rb") as f:
-            model = pickle.load(f)
-            opt_state = optimizer.init(params=model[0])
-
-    # Track the raw un-replicated CPU parameter formats for on-demand evaluation swapping
-    # This keeps our memory consumption footprint isolated strictly to host CPU RAM
-    baseline_model_cpu = jax.device_get(model)
-
-    # --- OPTIONAL: Load baseline weights if they exist ---
-    # TODO: optionally load the latest weights
-    base_weights = os.path.join("checkpoints", "base_weights.pkl")
-    if os.path.exists(base_weights):
-        print("Found baseline checkpoint! Loading weights...")
-        with open(base_weights, "rb") as f:
-            baseline_model_cpu = pickle.load(f)
-
-    # Replicate only our active training model and opt_state variables across devices
-    model = jax.tree_util.tree_map(
-        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
-    )
-    opt_state = jax.tree_util.tree_map(
-        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
-    )
 
     # Prepare checkpoint dir
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
@@ -398,117 +316,237 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Initialize logging dict
-    iteration: int = 0
-    hours: float = 0.0
-    frames: int = 0
-    metrics = {"iteration": 0, "hours": hours, "frames": frames}
+    # Initialize model and opt_state
+    dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
+    dummy_input = dummy_state.observation
+    model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
+    opt_state = optimizer.init(params=model[0])
 
-    rng_key = jax.random.PRNGKey(config.seed)
-    while True:
-        # Evaluation
-        if iteration % config.eval_interval == 0:
-            rng_key, eval_key = jax.random.split(rng_key)
-            keys = jax.random.split(eval_key, num_devices)
+    # Load a checkpoint to train from
+    if config.load_ckpt is not None:
+        if os.path.exists(config.load_ckpt):
+            print("Found checkpoint! Loading weights...")
+            with open(config.load_ckpt, "rb") as f:
+                model = pickle.load(f)
+                opt_state = optimizer.init(params=model[0])
 
-            # 1. Temporarily mirror the baseline weights to matching multi-device sharded layouts 
-            # only for the duration of this evaluation window.
-            baseline_model_sharded = jax.tree_util.tree_map(
-                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), baseline_model_cpu
+    # Train via supervised learning
+    if config.training_mode == "supervised":
+        sl_dataset_path = os.path.join("data", "sl_dataset.pkl")
+
+        if not os.path.exists(sl_dataset_path):
+            print(f"Dataset not found at {sl_dataset_path}. Run python data.py to download the dataset.")
+        else:
+            print("Found dataset! Commencing Supervised Pre-Training...")
+            with open(sl_dataset_path, "rb") as f:
+                # Expects a dict containing 'observations' and 'actions' arrays
+                dataset = pickle.load(f)
+
+            sl_obs = np.asarray(dataset["observations"])
+            sl_actions = np.asarray(dataset["actions"])
+
+            # Simple mini-batch loop parameters for SL profiling
+            sl_epochs = 5
+            sl_batch_size = config.training_batch_size
+            num_samples = sl_obs.shape[0]
+            num_batches = num_samples // sl_batch_size
+
+            # Temporarily shard the states onto active cores for the optimization step
+            sl_model = jax.tree_util.tree_map(
+                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
+            )
+            sl_opt_state = jax.tree_util.tree_map(
+                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
             )
 
-            # 2. Execute the evaluation steps
-            R = evaluate(keys, model, baseline_model_sharded)
+            hours: float = 0.0
+            global_step: int = 0
 
-            # 3. Explicitly delete the sharded reference to instantly clear VRAM allocations
-            del baseline_model_sharded
+            for epoch in range(sl_epochs):
+                indices = np.random.permutation(num_samples)
+                epoch_loss = 0.0
 
-            win_rate = ((R == 1).sum() / R.size).item()
-            draw_rate = ((R == 0).sum() / R.size).item()
-            loss_rate = ((R == -1).sum() / R.size).item()
+                for b in range(num_batches):
+                    st = time.time()
 
+                    batch_idx = indices[b * sl_batch_size : (b + 1) * sl_batch_size]
+                    raw_obs = sl_obs[batch_idx]
+                    raw_actions = sl_actions[batch_idx]
+                    reshaped_obs = raw_obs.reshape(num_devices, sl_batch_size // num_devices, *raw_obs.shape[1:])
+                    reshaped_actions = raw_actions.reshape(num_devices, sl_batch_size // num_devices, *raw_actions.shape[1:])
+                    batch_obs = jax.device_put(reshaped_obs)
+                    batch_actions = jax.device_put(reshaped_actions)
+                    sl_model, sl_opt_state, step_loss_device = supervised_train_step(
+                        sl_model, sl_opt_state, batch_obs, batch_actions
+                    )
+
+                    step_loss = float(jax.device_get(step_loss_device[0]))
+                    epoch_loss += step_loss
+                    global_step += 1
+                    et = time.time()
+                    hours += (et - st) / 3600
+
+                    log = {
+                        "supervised/epoch": epoch + 1,
+                        "supervised/step_loss": step_loss,
+                        "supervised/global_step": global_step,
+                        "hours": hours,
+                    }
+                    wandb.log(log)
+
+                avg_epoch_loss = epoch_loss / num_batches
+
+                log.update({"supervised/epoch_loss": avg_epoch_loss})
+                print(log)
+                wandb.log(log)
+
+            jax.effects_barrier()
+
+            # Unwrap parameters back to CPU configurations
+            model = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], sl_model))
+            opt_state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], sl_opt_state))
+
+            # Save structural checkpoint so this phase can be skipped on future runs
+            sl_weights = os.path.join("checkpoints", "sl_weights.pkl")
+            with open(sl_weights, "wb") as f:
+                pickle.dump(model, f)
+            print(f"Supervised training complete! Weights exported to {sl_weights}.")
+
+    # Train via RL
+    else:
+        # Track the raw un-replicated CPU parameter formats for on-demand evaluation swapping
+        # This keeps our memory consumption footprint isolated strictly to host CPU RAM
+        champion_model_cpu = jax.device_get(model)
+
+        # Load a champion
+        if config.champion is not None:
+            if not os.path.exists(config.champion):
+                print(f"Champion not found at {config.champion}.")
+            else:
+                print("Found champion checkpoint! Loading weights...")
+                with open(config.champion, "rb") as f:
+                    champion_model_cpu = pickle.load(f)
+
+        # Replicate only our active training model and opt_state variables across devices
+        model = jax.tree_util.tree_map(
+            lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
+        )
+        opt_state = jax.tree_util.tree_map(
+            lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
+        )
+
+        # Initialize logging dict
+        iteration: int = 0
+        hours: float = 0.0
+        frames: int = 0
+        metrics = {"iteration": 0, "hours": hours, "frames": frames}
+
+        rng_key = jax.random.PRNGKey(config.seed)
+        while True:
+            # Evaluation
+            if iteration % config.eval_interval == 0:
+                rng_key, eval_key = jax.random.split(rng_key)
+                keys = jax.random.split(eval_key, num_devices)
+
+                # 1. Temporarily mirror the baseline weights to matching multi-device sharded layouts 
+                # only for the duration of this evaluation window.
+                champion_model_sharded = jax.tree_util.tree_map(
+                    lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), champion_model_cpu
+                )
+
+                # 2. Execute the evaluation steps
+                R = evaluate(keys, model, champion_model_sharded)
+
+                # 3. Explicitly delete the sharded reference to instantly clear VRAM allocations
+                del champion_model_sharded
+
+                win_rate = ((R == 1).sum() / R.size).item()
+                draw_rate = ((R == 0).sum() / R.size).item()
+                loss_rate = ((R == -1).sum() / R.size).item()
+
+                metrics.update(
+                    {
+                        "eval/vs_baseline/avg_R": R.mean().item(),
+                        "eval/vs_baseline/win_rate": win_rate,
+                        "eval/vs_baseline/draw_rate": draw_rate,
+                        "eval/vs_baseline/lose_rate": loss_rate,
+                    }
+                )
+
+                # Store checkpoints
+                model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
+                chpt_0 = os.path.join(ckpt_dir, f"{iteration:06d}.ckpt")
+
+                cpu_model_snapshot = jax.device_get(model_0)
+
+                with open(chpt_0, "wb") as f:
+                    dic = {
+                        "config": config,
+                        "rng_key": rng_key,
+                        "model": cpu_model_snapshot,
+                        "opt_state": jax.device_get(opt_state_0),
+                        "iteration": iteration,
+                        "frames": frames,
+                        "hours": hours,
+                        "pgx.__version__": pgx.__version__,
+                        "env_id": env.id,
+                        "env_version": env.version,
+                    }
+                    pickle.dump(dic, f)
+
+                # Upgrades the baseline when the network shows meaningful improvement
+                if win_rate > 0.55:
+                    print(f"Model {chpt_0} dethroned the champion!")
+                    champion_model_cpu = cpu_model_snapshot
+                    champion_path = os.path.join(ckpt_dir, "champion")
+                    with open(champion_path, "w", encoding="utf-8") as f:
+                        f.write(chpt_0)
+
+            print(metrics)
+            wandb.log(metrics)
+
+            if iteration >= config.max_num_iters:
+                break
+
+            iteration += 1
+            metrics = {"iteration": iteration}
+            st = time.time()
+
+            # Selfplay
+            rng_key, subkey = jax.random.split(rng_key)
+            keys = jax.random.split(subkey, num_devices)
+            data: SelfplayOutput = selfplay(model, keys)
+            samples: Sample = compute_loss_input(data)
+
+            # Shuffle samples and make minibatches
+            samples = jax.device_get(samples)  # (#devices, batch, max_num_steps, ...)
+            frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2]
+            samples = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), samples)
+            rng_key, subkey = jax.random.split(rng_key)
+            ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
+            samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)  # shuffle
+            num_updates = samples.obs.shape[0] // config.training_batch_size
+            minibatches = jax.tree_util.tree_map(
+                lambda x: x.reshape((num_updates, num_devices, -1) + x.shape[1:]), samples
+            )
+
+            # Training
+            policy_losses, value_losses = [], []
+            for i in range(num_updates):
+                minibatch: Sample = jax.tree_util.tree_map(lambda x: x[i], minibatches)
+                model, opt_state, policy_loss, value_loss = train(model, opt_state, minibatch)
+                policy_losses.append(policy_loss.mean().item())
+                value_losses.append(value_loss.mean().item())
+            policy_loss = sum(policy_losses) / len(policy_losses)
+            value_loss = sum(value_losses) / len(value_losses)
+
+            et = time.time()
+            hours += (et - st) / 3600
             metrics.update(
                 {
-                    f"eval/vs_baseline/avg_R": R.mean().item(),
-                    f"eval/vs_baseline/win_rate": win_rate,
-                    f"eval/vs_baseline/draw_rate": draw_rate,
-                    f"eval/vs_baseline/lose_rate": loss_rate,
+                    "hours": hours,
+                    "frames": frames,
+                    "train/policy_loss": policy_loss,
+                    "train/value_loss": value_loss,
                 }
             )
-
-            # Store checkpoints
-            model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
-            chpt_0 = os.path.join(ckpt_dir, f"{iteration:06d}.ckpt")
-
-            cpu_model_snapshot = jax.device_get(model_0)
-
-            with open(chpt_0, "wb") as f:
-                dic = {
-                    "config": config,
-                    "rng_key": rng_key,
-                    "model": cpu_model_snapshot,
-                    "opt_state": jax.device_get(opt_state_0),
-                    "iteration": iteration,
-                    "frames": frames,
-                    "hours": hours,
-                    "pgx.__version__": pgx.__version__,
-                    "env_id": env.id,
-                    "env_version": env.version,
-                }
-                pickle.dump(dic, f)
-
-            # Upgrades the baseline when the network shows meaningful improvement
-            if win_rate > 0.55:
-                print(">>> Model outperformed old baseline snapshot. Updating target model parameters.")
-                baseline_model_cpu = cpu_model_snapshot
-                with open(base_weights, "wb") as f:
-                    pickle.dump(baseline_model_cpu, f)
-
-        print(metrics)
-        wandb.log(metrics)
-
-        if iteration >= config.max_num_iters:
-            break
-
-        iteration += 1
-        metrics = {"iteration": iteration}
-        st = time.time()
-
-        # Selfplay
-        rng_key, subkey = jax.random.split(rng_key)
-        keys = jax.random.split(subkey, num_devices)
-        data: SelfplayOutput = selfplay(model, keys)
-        samples: Sample = compute_loss_input(data)
-
-        # Shuffle samples and make minibatches
-        samples = jax.device_get(samples)  # (#devices, batch, max_num_steps, ...)
-        frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2]
-        samples = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), samples)
-        rng_key, subkey = jax.random.split(rng_key)
-        ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
-        samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)  # shuffle
-        num_updates = samples.obs.shape[0] // config.training_batch_size
-        minibatches = jax.tree_util.tree_map(
-            lambda x: x.reshape((num_updates, num_devices, -1) + x.shape[1:]), samples
-        )
-
-        # Training
-        policy_losses, value_losses = [], []
-        for i in range(num_updates):
-            minibatch: Sample = jax.tree_util.tree_map(lambda x: x[i], minibatches)
-            model, opt_state, policy_loss, value_loss = train(model, opt_state, minibatch)
-            policy_losses.append(policy_loss.mean().item())
-            value_losses.append(value_loss.mean().item())
-        policy_loss = sum(policy_losses) / len(policy_losses)
-        value_loss = sum(value_losses) / len(value_losses)
-
-        et = time.time()
-        hours += (et - st) / 3600
-        metrics.update(
-            {
-                "hours": hours,
-                "frames": frames,
-                "train/policy_loss": policy_loss,
-                "train/value_loss": value_loss,
-            }
-        )
