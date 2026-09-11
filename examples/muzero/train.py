@@ -273,17 +273,43 @@ def evaluate(rng_key, my_model, baseline_model):
 
 
 def supervised_loss_fn(model_params, model_state, obs, target_actions):
-    """Computes pure categorical cross-entropy loss against expert actions."""
+    """Computes categorical cross-entropy and tracking metrics against expert actions."""
     # Forward pass through your network
     (logits, _), model_state = forward.apply(
         model_params, model_state, obs, is_eval=False
     )
-
-    # Calculate cross entropy against the integer index of the expert move
+    
+    # Calculate cross entropy
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_actions)
     loss = jnp.mean(loss)
-
-    return loss, model_state
+    
+    # --- CALCULATE METRICS ---
+    # Top-1 Accuracy: Does the argmax match the target?
+    predictions = jnp.argmax(logits, axis=-1)
+    top1_acc = jnp.mean(predictions == target_actions)
+    
+    # Top-5 Accuracy: Is the target action in the top 5 predicted logits?
+    # jax.lax.top_k returns values and indices; we just need the indices
+    _, top5_indices = jax.lax.top_k(logits, k=5)
+    # Check if target matches any of the 5 columns along the last axis
+    top5_acc = jnp.mean(jnp.any(top5_indices == target_actions[:, None], axis=-1))
+    
+    # Policy Entropy: Measures model confidence (-sum(p * log(p)))
+    probs = jax.nn.softmax(logits, axis=-1)
+    # Add a tiny epsilon to prevent log(0)
+    entropy = -jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1)
+    mean_entropy = jnp.mean(entropy)
+    
+    # Bundle metrics into a custom dictionary inside your auxiliary payload
+    metrics = {
+        "loss": loss,
+        "top1_accuracy": top1_acc,
+        "top5_accuracy": top5_acc,
+        "entropy": mean_entropy
+    }
+    
+    # Return the loss scalar first, and the updated state + metrics as a tuple for has_aux
+    return loss, (model_state, metrics)
 
 
 @partial(jax.pmap, axis_name="i")
@@ -291,20 +317,20 @@ def supervised_train_step(model, opt_state, obs, target_actions):
     """A parallelized parameter update optimization step for supervised learning."""
     model_params, model_state = model
     
-    # Use value_and_grad to get the numerical loss and gradients simultaneously
-    (loss, model_state), grads = jax.value_and_grad(supervised_loss_fn, has_aux=True)(
+    # Capture the nested dictionary from has_aux
+    (loss, (model_state, metrics)), grads = jax.value_and_grad(supervised_loss_fn, has_aux=True)(
         model_params, model_state, obs, target_actions
     )
     
-    # Average gradients and loss across your parallel device cores
+    # Average gradients and your custom metric dictionary values across all cores
     grads = jax.lax.pmean(grads, axis_name="i")
-    loss = jax.lax.pmean(loss, axis_name="i")
+    metrics = jax.lax.pmean(metrics, axis_name="i")
     
     # Apply standard optimizer updates
     updates, opt_state = optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
     
-    return (model_params, model_state), opt_state, loss
+    return (model_params, model_state), opt_state, metrics
 
 
 if __name__ == "__main__":
@@ -380,6 +406,7 @@ if __name__ == "__main__":
                             "env_version": env.version,
                         }
                         pickle.dump(dic, f)
+                        print(f"Saved {chpt_0}")
 
                 if epoch >= config.max_num_iters:
                     break
@@ -398,21 +425,25 @@ if __name__ == "__main__":
                     reshaped_actions = raw_actions.reshape(num_devices, sl_batch_size // num_devices, *raw_actions.shape[1:])
                     batch_obs = jax.device_put(reshaped_obs)
                     batch_actions = jax.device_put(reshaped_actions)
-                    sl_model, sl_opt_state, sharded_loss = supervised_train_step(
+                    sl_model, sl_opt_state, sharded_metrics = supervised_train_step(
                         sl_model, sl_opt_state, batch_obs, batch_actions
                     )
 
-                    step_loss = float(jax.device_get(sharded_loss[0]))
+                    processed_metrics = {
+                        f"supervised/{k}": float(jax.device_get(jnp.mean(v)))
+                        for k, v in sharded_metrics.items()
+                    }
+                    step_loss = processed_metrics.get("supervised/loss", 0.0)
                     epoch_loss += step_loss
                     global_step += 1
                     et = time.time()
                     hours += (et - st) / 3600
 
                     log = {
-                        "supervised/epoch": epoch,
-                        "supervised/step_loss": step_loss,
-                        "supervised/global_step": global_step,
+                        "epoch": epoch,
+                        "step": global_step,
                         "hours": hours,
+                        **processed_metrics
                     }
                     wandb.log(log)
 
@@ -421,6 +452,58 @@ if __name__ == "__main__":
                 log.update({"supervised/epoch_loss": avg_epoch_loss})
                 print(log)
                 wandb.log(log)
+
+                current_top1 = log.get("supervised/top1_accuracy", 0.0)
+                current_entropy = log.get("supervised/entropy", 99.0)
+                
+                # Stop if accuracy is too high or entropy collapses too low
+                if current_top1 >= 0.55:
+                    print(f"\n[Early Stopping] Top-1 Accuracy reached {current_top1:.2%}. "
+                          f"Stopping to preserve RL exploration capabilities.")
+
+                    # Store checkpoints
+                    model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (sl_model, sl_opt_state))
+                    chpt_0 = os.path.join(ckpt_dir, f"{epoch:06d}.ckpt")
+                    cpu_model_snapshot = jax.device_get(model_0)
+                    with open(chpt_0, "wb") as f:
+                        dic = {
+                            "config": config,
+                            "model": cpu_model_snapshot,
+                            "opt_state": jax.device_get(opt_state_0),
+                            "epoch": epoch,
+                            "step": global_step,
+                            "hours": hours,
+                            "pgx.__version__": pgx.__version__,
+                            "env_id": env.id,
+                            "env_version": env.version,
+                        }
+                        pickle.dump(dic, f)
+                        print(f"Saved {chpt_0}")
+                    break
+                    
+                if current_entropy < 1.5:
+                    print(f"\n[Early Stopping] Policy Entropy dropped to {current_entropy:.2f}. "
+                          f"Stopping to prevent policy collapse before self-play.")
+
+                    # Store checkpoints
+                    model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (sl_model, sl_opt_state))
+                    chpt_0 = os.path.join(ckpt_dir, f"{epoch:06d}.ckpt")
+                    cpu_model_snapshot = jax.device_get(model_0)
+                    with open(chpt_0, "wb") as f:
+                        dic = {
+                            "config": config,
+                            "model": cpu_model_snapshot,
+                            "opt_state": jax.device_get(opt_state_0),
+                            "epoch": epoch,
+                            "step": global_step,
+                            "hours": hours,
+                            "pgx.__version__": pgx.__version__,
+                            "env_id": env.id,
+                            "env_version": env.version,
+                        }
+                        pickle.dump(dic, f)
+                        print(f"Saved {chpt_0}")
+                    break
 
             jax.effects_barrier()
 
