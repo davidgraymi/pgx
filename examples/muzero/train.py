@@ -278,11 +278,11 @@ def supervised_loss_fn(model_params, model_state, obs, target_actions):
     (logits, _), model_state = forward.apply(
         model_params, model_state, obs, is_eval=False
     )
-    
+
     # Calculate cross entropy against the integer index of the expert move
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_actions)
     loss = jnp.mean(loss)
-    
+
     return loss, model_state
 
 
@@ -291,12 +291,12 @@ def supervised_train_step(model, opt_state, obs, target_actions):
     """A parallelized parameter update optimization step for supervised learning."""
     model_params, model_state = model
     
-    # Calculate gradients
+    # Use value_and_grad to get the numerical loss and gradients simultaneously
     (loss, model_state), grads = jax.value_and_grad(supervised_loss_fn, has_aux=True)(
         model_params, model_state, obs, target_actions
     )
     
-    # Average gradients across your parallel accelerator execution cores
+    # Average gradients and loss across your parallel device cores
     grads = jax.lax.pmean(grads, axis_name="i")
     loss = jax.lax.pmean(loss, axis_name="i")
     
@@ -345,12 +345,6 @@ if __name__ == "__main__":
             sl_obs = np.asarray(dataset["observations"])
             sl_actions = np.asarray(dataset["actions"])
 
-            # Simple mini-batch loop parameters for SL profiling
-            sl_epochs = 5
-            sl_batch_size = config.training_batch_size
-            num_samples = sl_obs.shape[0]
-            num_batches = num_samples // sl_batch_size
-
             # Temporarily shard the states onto active cores for the optimization step
             sl_model = jax.tree_util.tree_map(
                 lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
@@ -359,10 +353,38 @@ if __name__ == "__main__":
                 lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
             )
 
+            # Simple mini-batch loop parameters for SL profiling
+            sl_batch_size: int = config.training_batch_size
+            num_samples: int = sl_obs.shape[0]
+            num_batches: int = num_samples // sl_batch_size
             hours: float = 0.0
             global_step: int = 0
+            epoch: int = 0
 
-            for epoch in range(sl_epochs):
+            while True:
+                if epoch % config.eval_interval == 0:
+                    # Store checkpoints
+                    model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (sl_model, sl_opt_state))
+                    chpt_0 = os.path.join(ckpt_dir, f"{epoch:06d}.ckpt")
+                    cpu_model_snapshot = jax.device_get(model_0)
+                    with open(chpt_0, "wb") as f:
+                        dic = {
+                            "config": config,
+                            "model": cpu_model_snapshot,
+                            "opt_state": jax.device_get(opt_state_0),
+                            "epoch": epoch,
+                            "step": global_step,
+                            "hours": hours,
+                            "pgx.__version__": pgx.__version__,
+                            "env_id": env.id,
+                            "env_version": env.version,
+                        }
+                        pickle.dump(dic, f)
+
+                if epoch >= config.max_num_iters:
+                    break
+
+                epoch += 1
                 indices = np.random.permutation(num_samples)
                 epoch_loss = 0.0
 
@@ -376,18 +398,18 @@ if __name__ == "__main__":
                     reshaped_actions = raw_actions.reshape(num_devices, sl_batch_size // num_devices, *raw_actions.shape[1:])
                     batch_obs = jax.device_put(reshaped_obs)
                     batch_actions = jax.device_put(reshaped_actions)
-                    sl_model, sl_opt_state, step_loss_device = supervised_train_step(
+                    sl_model, sl_opt_state, sharded_loss = supervised_train_step(
                         sl_model, sl_opt_state, batch_obs, batch_actions
                     )
 
-                    step_loss = float(jax.device_get(step_loss_device[0]))
+                    step_loss = float(jax.device_get(sharded_loss[0]))
                     epoch_loss += step_loss
                     global_step += 1
                     et = time.time()
                     hours += (et - st) / 3600
 
                     log = {
-                        "supervised/epoch": epoch + 1,
+                        "supervised/epoch": epoch,
                         "supervised/step_loss": step_loss,
                         "supervised/global_step": global_step,
                         "hours": hours,
