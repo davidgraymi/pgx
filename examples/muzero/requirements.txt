@@ -6,4 +6,3 @@ wandb
 omegaconf
 pydantic
 python-chess
-pandas
