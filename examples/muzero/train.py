@@ -55,6 +55,8 @@ class Config(BaseModel):
     selfplay_batch_size: int = 64
     num_simulations: int = 16
     max_num_steps: int = 128
+    root_dirichlet_alpha: float = 0.3
+    root_exploration_fraction: float = 0.25
     # training params
     training_batch_size: int = 2048
     learning_rate: float = 0.001
@@ -130,13 +132,30 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
     batch_size = config.selfplay_batch_size // num_devices
 
     def step_fn(state, key) -> SelfplayOutput:
-        key1, key2 = jax.random.split(key)
+        key1, key2, key_noise = jax.random.split(key, 3)
         observation = state.observation
 
+        # 1. Run standard forward pass to gather logits and value predictions
         (logits, value), _ = forward.apply(
             model_params, model_state, state.observation, is_eval=True
         )
-        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+
+        # 2. Sample raw Dirichlet noise using config.root_dirichlet_alpha
+        # (Standard default for Chess is 0.3)
+        noise_alpha = jnp.full((logits.shape[-1],), config.root_dirichlet_alpha)
+        dirichlet_noise = jax.random.dirichlet(key_noise, noise_alpha)
+        noise_logits = jnp.log(dirichlet_noise + 1e-8)
+
+        # 3. Mix exploration noise into raw model predictions using config.root_exploration_fraction
+        # (Standard default fraction is 0.25)
+        mixed_logits = (1.0 - config.root_exploration_fraction) * logits + config.root_exploration_fraction * noise_logits
+
+        # 4. Apply illegal move masking after mixing the noise
+        mixed_logits = mixed_logits - jnp.max(mixed_logits, axis=-1, keepdims=True)
+        masked_root_logits = jnp.where(state.legal_action_mask, mixed_logits, jnp.finfo(mixed_logits.dtype).min)
+
+        # Pack masked, noise-injected logits into the MCTS search blueprint
+        root = mctx.RootFnOutput(prior_logits=masked_root_logits, value=value, embedding=state)
 
         policy_output = mctx.gumbel_muzero_policy(
             params=model,
@@ -148,11 +167,13 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             qtransform=mctx.qtransform_completed_by_mix_value,
             gumbel_scale=1.0,
         )
+        
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
         discount = -1.0 * jnp.ones_like(value)
         discount = jnp.where(state.terminated, 0.0, discount)
+        
         return state, SelfplayOutput(
             obs=observation,
             action_weights=policy_output.action_weights,
@@ -331,6 +352,85 @@ def supervised_train_step(model, opt_state, obs, target_actions):
     model_params = optax.apply_updates(model_params, updates)
     
     return (model_params, model_state), opt_state, metrics
+
+
+def make_data_loader(config, num_devices):
+    """A clean generator that buffers raw unpadded frames and yields full sharded mini-batches."""
+    # Initialize rolling host memory banks
+    buffer_obs = np.empty((0,), dtype=np.float32)  # Will resize automatically on first concat
+    buffer_policy = np.empty((0,), dtype=np.float32)
+    buffer_value = np.empty((0,), dtype=np.float32)
+    buffer_mask = np.empty((0,), dtype=bool)
+
+    batch_per_device = config.training_batch_size // num_devices
+
+    while True:
+        # 1. Receive incoming raw sharded GPU data from the selfplay collection step
+        samples: Sample = yield
+        
+        # Pull sharded device data back to CPU host RAM
+        samples = jax.device_get(samples)
+
+        # Extract only real gameplay steps using the boolean mask array
+        valid_obs = samples.obs[samples.mask]
+        valid_policy = samples.policy_tgt[samples.mask]
+        valid_value = samples.value_tgt[samples.mask]
+        valid_mask = samples.mask[samples.mask]
+
+        # Initialize shapes correctly on the very first iteration step
+        if buffer_obs.ndim == 1:
+            buffer_obs = np.empty((0, *valid_obs.shape[1:]), dtype=valid_obs.dtype)
+            buffer_policy = np.empty((0, *valid_policy.shape[1:]), dtype=valid_policy.dtype)
+            buffer_value = np.empty((0, *valid_value.shape[1:]), dtype=valid_value.dtype)
+
+        # Append new unpadded frames to our persistent storage banks
+        buffer_obs = np.concatenate([buffer_obs, valid_obs], axis=0)
+        buffer_policy = np.concatenate([buffer_policy, valid_policy], axis=0)
+        buffer_value = np.concatenate([buffer_value, valid_value], axis=0)
+        buffer_mask = np.concatenate([buffer_mask, valid_mask], axis=0)
+
+        # Calculate total available complete mini-batches
+        num_updates = buffer_obs.shape[0] // config.training_batch_size
+        if num_updates == 0:
+            # Yield None to tell the outer loop to skip optimization and run another selfplay step
+            yield None
+            continue
+
+        total_elements_to_train = num_updates * config.training_batch_size
+
+        # Extract complete training slices from the front of the rolling storage buffer
+        train_obs = buffer_obs[:total_elements_to_train]
+        train_policy = buffer_policy[:total_elements_to_train]
+        train_value = buffer_value[:total_elements_to_train]
+        train_mask = buffer_mask[:total_elements_to_train]
+
+        # Retain leftovers for subsequent training windows
+        buffer_obs = buffer_obs[total_elements_to_train:]
+        buffer_policy = buffer_policy[total_elements_to_train:]
+        buffer_value = buffer_value[total_elements_to_train:]
+        buffer_mask = buffer_mask[total_elements_to_train:]
+
+        # Randomize execution sequences on the CPU
+        shuf_idx = np.random.permutation(total_elements_to_train)
+        train_obs = train_obs[shuf_idx]
+        train_policy = train_policy[shuf_idx]
+        train_value = train_value[shuf_idx]
+        train_mask = train_mask[shuf_idx]
+
+        # Reshape directly into JAX parallel structures: (num_updates, num_devices, batch_per_device, ...)
+        minibatches_obs = train_obs.reshape(num_updates, num_devices, batch_per_device, *train_obs.shape[1:])
+        minibatches_policy = train_policy.reshape(num_updates, num_devices, batch_per_device, *train_policy.shape[1:])
+        minibatches_value = train_value.reshape(num_updates, num_devices, batch_per_device, *train_value.shape[1:])
+        minibatches_mask = train_mask.reshape(num_updates, num_devices, batch_per_device, *train_mask.shape[1:])
+
+        # Build list of ready-to-run Sample namedtuples
+        batches_list = [
+            Sample(obs=minibatches_obs[i], policy_tgt=minibatches_policy[i], value_tgt=minibatches_value[i], mask=minibatches_mask[i])
+            for i in range(num_updates)
+        ]
+
+        # Send the processed batches back to the main loop execution thread
+        yield batches_list
 
 
 if __name__ == "__main__":
@@ -546,6 +646,8 @@ if __name__ == "__main__":
         frames: int = 0
         metrics = {"iteration": 0, "hours": hours, "frames": frames}
 
+        data_loader = make_data_loader(config, num_devices)
+
         rng_key = jax.random.PRNGKey(config.seed)
         while True:
             # Evaluation
@@ -622,36 +724,50 @@ if __name__ == "__main__":
             keys = jax.random.split(subkey, num_devices)
             data: SelfplayOutput = selfplay(model, keys)
             samples: Sample = compute_loss_input(data)
+            samples = jax.device_get(samples)
 
-            # Shuffle samples and make minibatches
-            samples = jax.device_get(samples)  # (#devices, batch, max_num_steps, ...)
-            frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2]
-            samples = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), samples)
-            rng_key, subkey = jax.random.split(rng_key)
-            ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
-            samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)  # shuffle
-            num_updates = samples.obs.shape[0] // config.training_batch_size
-            minibatches = jax.tree_util.tree_map(
-                lambda x: x.reshape((num_updates, num_devices, -1) + x.shape[1:]), samples
-            )
+            # Total steps per trajectory is the sum of unmasked steps (where value_mask is True)
+            # samples.mask shape: (num_devices, batch_size, max_num_steps)
+            steps_per_game = jax.device_get(samples.mask.sum(axis=2))  
+            avg_game_length = float(steps_per_game.mean())
+            min_game_length = float(steps_per_game.min())
+            frames += int(steps_per_game.sum())
+
+            next(data_loader)
+            minibatches = data_loader.send(samples)
+
+            if minibatches is None:
+                # Not enough frames have accumulated yet! Skip training optimization step this iteration
+                print(f"Accumulating frames... (Current Global Count: {frames})")
+                metrics.update({"hours": hours, "frames": frames, "selfplay/avg_game_length": avg_game_length, "speed/fps": 0})
+                wandb.log(metrics)
+                continue
 
             # Training
             policy_losses, value_losses = [], []
-            for i in range(num_updates):
-                minibatch: Sample = jax.tree_util.tree_map(lambda x: x[i], minibatches)
+            sharded_minibatches = [jax.device_put(b) for b in minibatches]
+
+            for minibatch in sharded_minibatches:
+                # Explicitly push the single clean minibatch to the GPU execution memory grids
                 model, opt_state, policy_loss, value_loss = train(model, opt_state, minibatch)
                 policy_losses.append(policy_loss.mean().item())
                 value_losses.append(value_loss.mean().item())
+
             policy_loss = sum(policy_losses) / len(policy_losses)
             value_loss = sum(value_losses) / len(value_losses)
 
             et = time.time()
-            hours += (et - st) / 3600
+            step_time = et - st
+            hours += step_time / 3600
+
             metrics.update(
                 {
                     "hours": hours,
                     "frames": frames,
                     "train/policy_loss": policy_loss,
                     "train/value_loss": value_loss,
+                    "selfplay/avg_game_length": avg_game_length,
+                    "selfplay/min_game_length": min_game_length,
+                    "speed/fps": int(len(minibatches) * config.training_batch_size / (et - st + 1e-8))
                 }
             )
