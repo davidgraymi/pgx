@@ -102,48 +102,243 @@ def iter_training_games(pgn_path: str, min_elo: int):
             yield game
 
 
-def download_and_preprocess(
-    months=("2024-10",),
-    data_dir: str = "data",
-    output_path: str = "data/sl_dataset.pkl",
-    max_positions: int = 100000,
-    min_elo: int = 2200,
-):
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+class StratifiedReservoir:
+    phases = ("opening", "middlegame", "endgame")
 
-    if os.path.exists(output_path):
-        print("Dataset already compiled.")
+    def __init__(self, max_positions: int, rng: np.random.Generator):
+        opening_capacity = max(1, max_positions // 4)
+        middlegame_capacity = max(1, max_positions // 2)
+        endgame_capacity = max(1, max_positions - opening_capacity - middlegame_capacity)
+        self.phase_capacities = {
+            "opening": opening_capacity,
+            "middlegame": middlegame_capacity,
+            "endgame": endgame_capacity,
+        }
+        self.opening_buckets = 50
+        self.rng = rng
+        self.buckets = {}
+        self.seen = {}
+        self.phase_counts = {phase: 0 for phase in self.phases}
+
+    def _remove_random(self, phase, excluded_key):
+        candidates = [
+            key
+            for key, bucket in self.buckets.items()
+            if key[0] == phase and key != excluded_key and bucket["obs"]
+        ]
+        if not candidates:
+            candidates = [
+                key for key, bucket in self.buckets.items() if key[0] == phase and bucket["obs"]
+            ]
+        largest_size = max(len(self.buckets[key]["obs"]) for key in candidates)
+        candidates = [key for key in candidates if len(self.buckets[key]["obs"]) == largest_size]
+        key = candidates[int(self.rng.integers(len(candidates)))]
+        bucket = self.buckets[key]
+        index = int(self.rng.integers(len(bucket["obs"])))
+        for values in bucket.values():
+            values.pop(index)
+        self.phase_counts[phase] -= 1
+
+    def add(self, observation, action, month, game_id, phase, opening):
+        key = (phase, opening)
+        bucket = self.buckets.setdefault(key, {"obs": [], "actions": [], "months": [], "games": [], "phases": []})
+        seen = self.seen.get(key, 0) + 1
+        self.seen[key] = seen
+        capacity = max(1, self.phase_capacities[phase] // self.opening_buckets)
+        if len(bucket["obs"]) >= capacity:
+            index = self.rng.integers(seen)
+            if index >= capacity:
+                return
+            values = (observation, action, month, game_id, phase)
+            bucket["obs"][index], bucket["actions"][index], bucket["months"][index], bucket["games"][index], bucket["phases"][index] = values
+            return
+
+        values = (observation, action, month, game_id, phase)
+        for name, value in zip(("obs", "actions", "months", "games", "phases"), values):
+            bucket[name].append(value)
+        self.phase_counts[phase] += 1
+        if self.phase_counts[phase] > self.phase_capacities[phase]:
+            self._remove_random(phase, key)
+
+    def flatten(self):
+        observations, actions, months, games, phases, openings = [], [], [], [], [], []
+        for phase in self.phases:
+            for (bucket_phase, opening), bucket in sorted(self.buckets.items()):
+                if bucket_phase != phase:
+                    continue
+                observations.extend(bucket["obs"])
+                actions.extend(bucket["actions"])
+                months.extend(bucket["months"])
+                games.extend(bucket["games"])
+                phases.extend(bucket["phases"])
+                openings.extend([opening] * len(bucket["obs"]))
+        return observations, actions, months, games, phases, openings
+
+    def __len__(self):
+        return sum(len(bucket["obs"]) for bucket in self.buckets.values())
+
+
+def save_dataset_checkpoint(
+    output_path: str,
+    observations,
+    actions,
+    sample_months,
+    sample_game_ids,
+    sample_phases,
+    sample_openings,
+    positions_seen: int,
+    games_seen: int,
+    reason: str,
+    split: str,
+):
+    observations = np.stack(observations, axis=0).astype(np.float16)
+    actions = np.asarray(actions, dtype=np.uint16)
+    action_counts = np.bincount(actions, minlength=4672)
+    action_probs = action_counts[action_counts > 0] / actions.size
+    action_entropy = -np.sum(action_probs * np.log2(action_probs))
+    action_entropy_pct = action_entropy / np.log2(4672) * 100.0
+    unique_games = len(set(sample_game_ids))
+    unique_months = len(set(sample_months))
+    unique_openings = len(set(sample_openings))
+    unique_actions = np.count_nonzero(action_counts)
+    phase_counts = {phase: sample_phases.count(phase) for phase in ("opening", "middlegame", "endgame")}
+
+    metadata = {
+        "format_version": 5,
+        "split": split,
+        "positions_seen": positions_seen,
+        "games_seen": games_seen,
+        "sample_months": np.asarray(sample_months),
+        "sample_game_ids": np.asarray(sample_game_ids, dtype=np.int64),
+        "sample_phases": np.asarray(sample_phases),
+        "sample_openings": np.asarray(sample_openings),
+    }
+    temporary_path = output_path + ".tmp"
+    if output_path.endswith(".npz"):
+        with open(temporary_path, "wb") as f:
+            np.savez_compressed(
+                f,
+                observations=observations,
+                actions=actions,
+                **metadata,
+            )
+    else:
+        with open(temporary_path, "wb") as f:
+            pickle.dump({"observations": observations, "actions": actions, **metadata}, f)
+    os.replace(temporary_path, output_path)
+
+    print(
+        f"[Dataset Save: {split} / {reason}] {output_path} | "
+        f"{len(actions)} retained / {positions_seen} seen | "
+        f"{unique_games} games, {unique_openings} openings across {unique_months} months | "
+        f"phases O/M/E {phase_counts['opening']}/{phase_counts['middlegame']}/{phase_counts['endgame']} | "
+        f"{unique_actions}/4672 actions | "
+        f"action entropy {action_entropy_pct:.1f}%"
+    )
+
+
+def _dataset_is_current(path: str, min_positions: int) -> bool:
+    if not os.path.exists(path):
+        return False
+    try:
+        if path.endswith(".npz"):
+            with np.load(path) as dataset:
+                positions = dataset["observations"].shape[0]
+                version = int(dataset["format_version"]) if "format_version" in dataset.files else 0
+        else:
+            with open(path, "rb") as f:
+                dataset = pickle.load(f)
+            positions = dataset["observations"].shape[0]
+            version = dataset.get("format_version", 0)
+        return positions >= min_positions and version >= 5
+    except (OSError, KeyError, ValueError, pickle.PickleError):
+        return False
+
+
+def download_and_preprocess(
+    months=("2024-10", "2024-11", "2024-12"),
+    data_dir: str = "data",
+    output_path: str = "data/sl_dataset.npz",
+    max_positions: int = 250000,
+    min_elo: int = 2200,
+    cleanup_source: bool = True,
+    sample_seed: int = 0,
+    save_interval_positions: int = 1_000_000,
+    validation_fraction: float = 0.1,
+    validation_output_path: str = "data/sl_validation.npz",
+    validation_max_positions: int | None = None,
+):
+    if save_interval_positions <= 0:
+        raise ValueError("save_interval_positions must be positive")
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1")
+    if validation_max_positions is None:
+        validation_max_positions = max_positions // 5
+    if validation_max_positions <= 0:
+        raise ValueError("validation_max_positions must be positive")
+    if os.path.abspath(output_path) == os.path.abspath(validation_output_path):
+        raise ValueError("Training and validation outputs must be different files")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(validation_output_path) or ".", exist_ok=True)
+
+    if _dataset_is_current(output_path, max_positions) and _dataset_is_current(
+        validation_output_path, validation_max_positions
+    ):
+        print("Training and validation datasets already compiled.")
         return
 
     env = pgx.make("chess")
     env_init = jax.jit(env.init)
     env_step = jax.jit(env.step)
     key = jax.random.PRNGKey(0)
+    sample_rng = np.random.default_rng(sample_seed)
+    split_rng = np.random.default_rng(sample_seed + 1)
 
-    obs_list, act_list = [], []
-    games_seen = games_used = 0
+    games_seen = games_used = positions_seen = 0
+    train_positions_seen = validation_positions_seen = 0
+    last_saved_positions = 0
+    train_reservoir = StratifiedReservoir(max_positions, sample_rng)
+    validation_reservoir = StratifiedReservoir(validation_max_positions, np.random.default_rng(sample_seed + 2))
+
+    def save_reservoir(reservoir, path, positions, reason, split):
+        if len(reservoir) == 0:
+            return
+        save_dataset_checkpoint(
+            path,
+            *reservoir.flatten(),
+            positions,
+            games_seen,
+            reason,
+            split,
+        )
+
+    def save_datasets(reason):
+        save_reservoir(train_reservoir, output_path, train_positions_seen, reason, "train")
+        save_reservoir(
+            validation_reservoir,
+            validation_output_path,
+            validation_positions_seen,
+            reason,
+            "validation",
+        )
 
     for month in months:
-        if len(obs_list) >= max_positions:
-            break
-
         pgn_path = download_month(month, data_dir)
         print(f"Parsing {pgn_path} ...")
 
         for game in iter_training_games(pgn_path, min_elo):
-            if len(obs_list) >= max_positions:
-                break
-
             games_seen += 1
             board = game.board()
             state = env_init(key)
             added = 0
+            validation_game = split_rng.random() < validation_fraction
 
-            for move in game.mainline_moves():
-                if len(obs_list) >= max_positions:
-                    break
+            opening = str(game.headers.get("ECO", "")).strip()
+            if not opening or opening in {"?", "-"}:
+                opening = f"unknown_{games_seen % train_reservoir.opening_buckets:02d}"
 
+            for ply, move in enumerate(game.mainline_moves()):
                 try:
                     action = move_to_action(board, move)
                 except KeyError:
@@ -151,9 +346,31 @@ def download_and_preprocess(
                 if not (0 <= action < 4672) or not bool(state.legal_action_mask[action]):
                     break  # conversion/board desync; stop trusting the rest of this game
 
-                obs_list.append(np.array(state.observation))
-                act_list.append(action)
+                observation = np.array(state.observation)
+                positions_seen += 1
+                if validation_game:
+                    validation_positions_seen += 1
+                    target_reservoir = validation_reservoir
+                else:
+                    train_positions_seen += 1
+                    target_reservoir = train_reservoir
+                non_pawn_pieces = sum(
+                    len(board.pieces(piece, color))
+                    for piece in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+                    for color in (chess.WHITE, chess.BLACK)
+                )
+                if ply < 20:
+                    phase = "opening"
+                elif non_pawn_pieces <= 6:
+                    phase = "endgame"
+                else:
+                    phase = "middlegame"
+                target_reservoir.add(observation, action, month, games_seen, phase, opening)
                 added += 1
+
+                if positions_seen - last_saved_positions >= save_interval_positions:
+                    save_datasets(f"{positions_seen} positions seen")
+                    last_saved_positions = positions_seen
 
                 state = env_step(state, action)
                 board.push(move)
@@ -162,22 +379,31 @@ def download_and_preprocess(
 
             games_used += added > 0
             if games_seen % 200 == 0:
-                print(f"  ...{games_seen} games scanned, {games_used} used, {len(obs_list)} positions collected")
+                print(
+                    f"  ...{games_seen} games scanned, {games_used} used, "
+                    f"{positions_seen} positions seen, {len(train_reservoir)} train / "
+                    f"{len(validation_reservoir)} validation retained"
+                )
 
-    if not obs_list:
+        if positions_seen > last_saved_positions and len(train_reservoir):
+            save_datasets(f"completed {month}")
+            last_saved_positions = positions_seen
+
+    if not len(train_reservoir) or not len(validation_reservoir):
         print("No positions found matching filter criteria.")
         return
 
-    dataset = {
-        "observations": np.stack(obs_list, axis=0).astype(np.float32),
-        "actions": np.array(act_list, dtype=np.int32),
-    }
-    with open(output_path, "wb") as f:
-        pickle.dump(dataset, f)
+    save_datasets("final")
+
+    if cleanup_source:
+        for month in months:
+            source_path = os.path.join(data_dir, f"lichess_elite_{month}.pgn")
+            if os.path.exists(source_path):
+                os.remove(source_path)
 
     print(
-        f"Complete! {len(act_list)} positions from {games_used}/{games_seen} games saved to "
-        f"{output_path} (shape: {dataset['observations'].shape})"
+        f"Complete! {len(train_reservoir)} train and {len(validation_reservoir)} validation "
+        f"positions from {games_used}/{games_seen} games saved."
     )
 
 

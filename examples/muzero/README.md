@@ -13,7 +13,45 @@ Note that you need to install `jax` and `jaxlib` in addition to the packages wri
 
 ```sh
 $ pip install -U pip && pip install -r requirements.txt
-$ python3 train.py env_id=go_9x9 seed=0
+$ python3 data.py
+$ python3 train.py env_id=chess seed=0
+```
+
+The data-preparation step scans three monthly elite databases and retains a
+stratified random sample of up to 250,000 positions: 25% opening, 50%
+middlegame, and 25% endgame, with a per-opening cap. It stores observations as
+compressed `float16` data and removes the extracted PGNs after preprocessing.
+Ten percent of complete games are reserved for `data/sl_validation.npz`; no
+positions from those games enter training. Supervised training reports held-out
+loss and top-1/top-5 accuracy after every epoch.
+If an older compiled dataset contains fewer positions, `data.py` rebuilds it.
+While scanning, it overwrites `data/sl_dataset.npz` every 1,000,000 positions
+and after each month. Each save reports retained games, month coverage, action
+coverage, and action entropy, so an interrupted run still leaves a usable dataset.
+The default chess run uses a smaller network, eight self-play games per batch,
+64 search simulations, and a 50,000-position host replay buffer for a 6 GB GPU.
+`training_mode=pipeline` first trains on `data/sl_dataset.npz`, plays 64 balanced
+games against a uniform random player, and starts RL only when the score reaches
+`supervised_min_random_score`. Set `require_random_win=false` to bypass that gate.
+The pipeline reports the same random-opponent evaluation before and after
+supervised training for a direct comparison.
+Evaluation uses the model's highest-scoring legal move; only the random opponent
+samples moves.
+Supervised training runs up to `supervised_epochs`, stopping when held-out loss
+fails to improve for `supervised_validation_patience` epochs and restoring the
+best validation-loss model. Training entropy and accuracy are logged only.
+
+Checkpoints contain model and optimizer state only. The replay buffer is stored
+once as `replay_buffer.pkl` beside the checkpoints and overwritten in place;
+override it with `replay_buffer_path=...` when resuming a run.
+RL uses a 50,000-position ring buffer, samples it without copying the whole
+buffer, and bootstraps value targets for rollouts that reach the step limit.
+
+Useful resource controls:
+
+```sh
+$ python3 train.py training_mode=pipeline selfplay_batch_size=4 num_simulations=32
+$ python3 train.py training_mode=pipeline eval_games=128 supervised_eval_games=128
 ```
 
 ## Reference
