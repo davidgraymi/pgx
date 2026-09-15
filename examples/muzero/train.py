@@ -53,8 +53,8 @@ class Config(BaseModel):
     num_layers: int = 6
     resnet_v2: bool = True
     # selfplay params
-    selfplay_batch_size: int = 64
-    num_simulations: int = 16
+    selfplay_batch_size: int = 32
+    num_simulations: int = 128
     max_num_steps: int = 128
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
@@ -125,6 +125,8 @@ class SelfplayOutput(NamedTuple):
     terminated: jnp.ndarray
     action_weights: jnp.ndarray
     discount: jnp.ndarray
+    max_visits: jnp.ndarray
+    legal_pct: jnp.ndarray
 
 
 @jax.pmap
@@ -168,6 +170,11 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             qtransform=mctx.qtransform_completed_by_mix_value,
             gumbel_scale=1.0,
         )
+
+        summary = policy_output.search_tree.summary()
+
+        max_root_visits = jnp.max(summary.visit_counts, axis=-1)
+        legal_percentage = jnp.mean(state.legal_action_mask.astype(jnp.float32), axis=-1)
         
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
@@ -181,6 +188,8 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor],
             terminated=state.terminated,
             discount=discount,
+            max_visits=max_root_visits,
+            legal_pct=legal_percentage
         )
 
     # Run selfplay for max_num_steps by batch
@@ -236,20 +245,22 @@ def loss_fn(model_params, model_state, samples: Sample):
     value_loss = optax.l2_loss(value, samples.value_tgt)
     value_loss = jnp.mean(value_loss * samples.mask)
 
-    return policy_loss + value_loss, (model_state, policy_loss, value_loss)
+    avg_pred_value_magnitude = jnp.mean(jnp.abs(value))
+
+    return policy_loss + value_loss, (model_state, policy_loss, value_loss, avg_pred_value_magnitude)
 
 
 @partial(jax.pmap, axis_name="i")
 def train(model, opt_state, data: Sample):
     model_params, model_state = model
-    grads, (model_state, policy_loss, value_loss) = jax.grad(loss_fn, has_aux=True)(
+    grads, (model_state, policy_loss, value_loss, val_magnitude) = jax.grad(loss_fn, has_aux=True)(
         model_params, model_state, data
     )
     grads = jax.lax.pmean(grads, axis_name="i")
     updates, opt_state = optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
     model = (model_params, model_state)
-    return model, opt_state, policy_loss, value_loss
+    return model, opt_state, policy_loss, value_loss, val_magnitude
 
 
 @jax.pmap
@@ -285,6 +296,88 @@ def evaluate(rng_key, my_model, baseline_model):
         key, subkey = jax.random.split(key)
         action = jax.random.categorical(subkey, logits, axis=-1)
         state = jax.vmap(env.step)(state, action)
+        R = R + state.rewards[jnp.arange(batch_size), my_player]
+        return (key, state, R)
+
+    _, _, R = jax.lax.while_loop(
+        lambda x: ~(x[1].terminated.all()), body_fn, (key, state, jnp.zeros(batch_size))
+    )
+    return R
+
+
+@jax.jit
+def evaluate_offline_metrics(forward_apply_fn, model_params, model_state, obs_batch, legal_masks_batch, target_actions_batch):
+    """
+    Computes policy accuracy and entropy metrics over a batch of human expert data.
+    """
+    # 1. Run the raw model forward evaluation pass right here
+    (logits, _), _ = forward_apply_fn(model_params, model_state, obs_batch, is_eval=True)
+    
+    # 2. Mask illegal actions to ensure we evaluate valid distributions
+    masked_logits = jnp.where(legal_masks_batch, logits, -1e9)
+    probs = jax.nn.softmax(masked_logits, axis=-1)
+    
+    # 3. Calculate Policy Entropy
+    safe_probs = jnp.where(legal_masks_batch, probs, 1.0)
+    entropy = -jnp.sum(probs * jnp.log(safe_probs + 1e-8), axis=-1)
+    mean_entropy = jnp.mean(entropy)
+    
+    # 4. Total Legal Probability Mass
+    raw_probs = jax.nn.softmax(logits, axis=-1)
+    legal_mass = jnp.mean(jnp.sum(raw_probs * legal_masks_batch, axis=-1))
+
+    # 5. Top-1 and Top-5 Accuracy Checks
+    top_1_predictions = jnp.argmax(probs, axis=-1)
+    top_1_acc = jnp.mean(top_1_predictions == target_actions_batch)
+    
+    top_5_predictions = jnp.argsort(probs, axis=-1)[:, -5:]
+    top_5_acc = jnp.mean(jnp.any(top_5_predictions == target_actions_batch[:, None], axis=-1))
+    
+    return {
+        "val_top_1_accuracy": top_1_acc,
+        "val_top_5_accuracy": top_5_acc,
+        "val_policy_entropy": mean_entropy,
+        "val_legal_move_mass": legal_mass
+    }
+
+
+@jax.pmap
+def evaluate_vs_random(rng_key, my_model):
+    """Evaluates the live learning model against a uniform random legal opponent."""
+    my_player = 0
+    my_model_params, my_model_state = my_model
+
+    key, subkey = jax.random.split(rng_key)
+    batch_size = config.selfplay_batch_size // num_devices
+    keys = jax.random.split(subkey, batch_size)
+    state = jax.vmap(env.init)(keys)
+
+    def body_fn(val):
+        key, state, R = val
+        
+        # 1. Active Learning Agent Policy Pass
+        (my_logits, _), _ = forward.apply(
+            my_model_params, my_model_state, state.observation, is_eval=True
+        )
+        # Apply mask to your model's logits
+        my_logits = my_logits - jnp.max(my_logits, axis=-1, keepdims=True)
+        my_logits = jnp.where(state.legal_action_mask, my_logits, jnp.finfo(my_logits.dtype).min)
+        
+        # 2. Random Agent Policy Pass
+        # We assign an equal logit value (0.0) to all moves, then mask out illegal ones.
+        # This creates a uniform distribution over only legal actions.
+        random_logits = jnp.where(state.legal_action_mask, 0.0, jnp.finfo(jnp.float32).min)
+        
+        # 3. Route logits based on whose turn it is
+        is_my_turn = (state.current_player == my_player).reshape((-1, 1))
+        logits = jnp.where(is_my_turn, my_logits, random_logits)
+        
+        # 4. Sample and execute actions
+        key, subkey = jax.random.split(key)
+        action = jax.random.categorical(subkey, logits, axis=-1)
+        state = jax.vmap(env.step)(state, action)
+        
+        # Accumulate rewards from the perspective of my_player
         R = R + state.rewards[jnp.arange(batch_size), my_player]
         return (key, state, R)
 
@@ -457,6 +550,39 @@ def run_supervised_training(config, model, opt_state, num_devices, sharding, ckp
 
 def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, iteration, frames, hours, rng_key, buffer_state):
     """Executes the core MuZero RL continuum using dynamic history sampling."""
+    # sl_dataset_path = os.path.join("data", "sl_dataset.pkl")
+    # has_validation_data = os.path.exists(sl_dataset_path)
+    # val_obs, val_actions, val_masks = None, None, None
+
+    # if has_validation_data:
+    #     print("\n=== Loading Offline Lichess Dataset for Periodic Validation ===")
+    #     with open(sl_dataset_path, "rb") as f:
+    #         val_dataset = pickle.load(f)
+        
+    #     # Take a fixed subset (e.g., 2048 positions) to keep evaluation extremely fast
+    #     val_subset_size = min(2048, val_dataset["observations"].shape[0])
+        
+    #     # We need legal move masks for the offline metrics function. 
+    #     # We can extract them by mapping env.init or evaluating the current state, 
+    #     # but since pgx observations don't store the raw mask explicitly, we can generate 
+    #     # a dummy array or filter our batch. For offline mapping against human targets,
+    #     # we can pass an all-True mask or a structural mask if available.
+    #     # Let's create an all-True fallback mask if the dataset doesn't have it.
+    #     val_obs = np.asarray(val_dataset["observations"][:val_subset_size])
+    #     val_actions = np.asarray(val_dataset["actions"][:val_subset_size])
+        
+    #     # Shape: (val_subset_size, 4672) matching pgx.chess action space
+    #     val_masks = np.ones((val_subset_size, env.num_actions), dtype=bool) 
+        
+    #     # Reshape data structures cleanly to shard across your PMAP devices
+    #     val_obs = val_obs.reshape(num_devices, val_subset_size // num_devices, *val_obs.shape[1:])
+    #     val_actions = val_actions.reshape(num_devices, val_subset_size // num_devices)
+    #     val_masks = val_masks.reshape(num_devices, val_subset_size // num_devices, env.num_actions)
+        
+    #     print(f"Loaded {val_subset_size} offline validation positions successfully.")
+    # else:
+    #     print("\n[Warning] sl_dataset.pkl not found. Offline metric tracking will be skipped.")
+
     # Load a champion
     champion_model_cpu = jax.device_get(model)
     if config.champion is not None and os.path.exists(config.champion):
@@ -481,14 +607,12 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
     )
 
     data_loader = make_data_loader(config, num_devices)
+    next(data_loader)
 
     if buffer_state is not None:
         print("\n=== Found saved experience history. Restoring Replay Buffer Workspace ===")
-        next(data_loader)
-        status = data_loader.send(buffer_state)
-        if status == "LOAD_OK":
-            print("Replay Buffer successfully primed with historical experience arrays.")
-
+        data_loader.send(buffer_state)
+        print("Replay Buffer successfully primed with historical experience arrays.")
 
     print("\n=== Initializing Replay Buffer Warmup ===")
     warmup_batches = None
@@ -500,7 +624,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         # Generate raw un-incremented selfplay data
         rng_key, subkey = jax.random.split(rng_key)
         keys = jax.random.split(subkey, num_devices)
-        data = selfplay(model, keys)
+        data: SelfplayOutput = selfplay(model, keys)
         samples = compute_loss_input(data)
 
         # Track frames experienced during warmup
@@ -539,22 +663,62 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), champion_model_cpu
             )
 
-            R = evaluate(keys, model, champion_model_sharded)
+            R_champ = evaluate(keys, model, champion_model_sharded)
             del champion_model_sharded
 
-            win_rate = ((R == 1).sum() / R.size).item()
-            draw_rate = ((R == 0).sum() / R.size).item()
-            lose_rate = ((R == -1).sum() / R.size).item()
+            win_rate_champ = ((R_champ == 1).sum() / R_champ.size).item()
+            draw_rate_champ = ((R_champ == 0).sum() / R_champ.size).item()
+            lose_rate_champ = ((R_champ == -1).sum() / R_champ.size).item()
 
-            metrics = {
-                "eval/vs_baseline/avg_R": R.mean().item(),
-                "eval/vs_baseline/win_rate": win_rate,
-                "eval/vs_baseline/draw_rate": draw_rate,
-                "eval/vs_baseline/lose_rate": lose_rate,
+            R_rand = evaluate_vs_random(keys, model)
+
+            win_rate_rand = ((R_rand == 1).sum() / R_rand.size).item()
+            draw_rate_rand = ((R_rand == 0).sum() / R_rand.size).item()
+            lose_rate_rand = ((R_rand == -1).sum() / R_rand.size).item()
+
+            log = {
+                "eval/vs_baseline/avg_R": R_champ.mean().item(),
+                "eval/vs_baseline/win_rate": win_rate_champ,
+                "eval/vs_baseline/draw_rate": draw_rate_champ,
+                "eval/vs_baseline/lose_rate": lose_rate_champ,
+                "eval/vs_random/avg_R": R_rand.mean().item(),
+                "eval/vs_random/win_rate": win_rate_rand,
+                "eval/vs_random/draw_rate": draw_rate_rand,
+                "eval/vs_random/lose_rate": lose_rate_rand,
                 "iteration": iteration, "frames": frames, "hours": hours
             }
-            print(metrics)
-            wandb.log(metrics)
+
+            # if has_validation_data:
+            #     # Extract a clean, single-device parameter slice from your multi-device model weights
+            #     model_params, model_state = model
+                
+            #     # Define a pure local forward function that does not close over sharded parameters
+            #     def batch_forward(obs):
+            #         (logits, _), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
+            #         return logits
+
+            #     # Reconstruct your validation data arrays without the leading device axis
+            #     flat_val_obs = val_obs.reshape(-1, *val_obs.shape[2:])
+            #     flat_val_masks = val_masks.reshape(-1, *val_masks.shape[2:])
+            #     flat_val_actions = val_actions.reshape(-1)
+
+            #     # FIX: Explicitly pass batch_forward as the first positional argument!
+            #     val_outputs = evaluate_offline_metrics(
+            #         batch_forward, 
+            #         flat_val_obs, 
+            #         flat_val_masks, 
+            #         flat_val_actions
+            #     )
+
+            #     # Pull the results back to the logging dictionary
+            #     log["eval/offline/top1_accuracy"] = float(jax.device_get(val_outputs["val_top_1_accuracy"]))
+            #     log["eval/offline/top5_accuracy"] = float(jax.device_get(val_outputs["val_top_5_accuracy"]))
+            #     log["eval/offline/policy_entropy"] = float(jax.device_get(val_outputs["val_policy_entropy"]))
+            #     log["eval/offline/legal_move_mass"] = float(jax.device_get(val_outputs["val_legal_move_mass"]))
+            
+            wandb.log(log)
+            log_str = ", ".join([f"{k}: {v}" for k, v in log.items()])
+            print(f"[EVAL UPDATE] {log_str}")
 
             next(data_loader)
             current_buffer_snapshot = data_loader.send("SAVE")
@@ -576,7 +740,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "env_version": env.version,
             })
 
-            if win_rate > 0.55:
+            if win_rate_champ > 0.55:
                 print(f"Model {chpt_0} dethroned the champion!")
                 champion_model_cpu = jax.device_get(model_0)
                 champion_path = os.path.join(ckpt_dir, "champion")
@@ -587,23 +751,31 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             break
 
         loop_start_time = time.time()
-        policy_losses, value_losses = [], []
+        policy_losses, value_losses, val_magnitudes = [], [], []
         sharded_minibatches = [jax.device_put(b) for b in minibatches]
 
         for minibatch in sharded_minibatches:
-            model, opt_state, policy_loss, value_loss = train(model, opt_state, minibatch)
+            model, opt_state, policy_loss, value_loss, v_mag = train(model, opt_state, minibatch)
             policy_losses.append(policy_loss.mean().item())
             value_losses.append(value_loss.mean().item())
+            val_magnitudes.append(v_mag.mean().item())
 
         iteration += 1
 
         # Re-Generate Fresh Samples for the next iteration cycle
         rng_key, subkey = jax.random.split(rng_key)
         keys = jax.random.split(subkey, num_devices)
-        data = selfplay(model, keys)
+        data: SelfplayOutput = selfplay(model, keys)
         samples = compute_loss_input(data)
+        samples = jax.device_get(samples)
 
-        steps_per_game = jax.device_get(samples.mask.sum(axis=2))
+        gpu_avg_max_visits = jnp.mean(data.max_visits[samples.mask])
+        gpu_avg_legal_pct = jnp.mean(data.legal_pct[samples.mask])
+
+        avg_max_visits = float(jax.device_get(gpu_avg_max_visits))
+        avg_legal_pct = float(jax.device_get(gpu_avg_legal_pct))
+
+        steps_per_game = samples.mask.sum(axis=2)
         avg_game_length = float(steps_per_game.mean())
         frames += int(steps_per_game.sum())
 
@@ -615,7 +787,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         while minibatches is None:
             rng_key, subkey = jax.random.split(rng_key)
             keys = jax.random.split(subkey, num_devices)
-            data = selfplay(model, keys)
+            data: SelfplayOutput = selfplay(model, keys)
             samples = compute_loss_input(data)
             steps_per_game = jax.device_get(samples.mask.sum(axis=2))
             frames += int(steps_per_game.sum())
@@ -625,16 +797,22 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         loop_elapsed_time = time.time() - loop_start_time
         hours += loop_elapsed_time / 3600
 
-        wandb.log({
+        log = {
             "iteration": iteration, 
             "hours": hours, 
             "frames": frames,
             "train/policy_loss": sum(policy_losses) / len(policy_losses),
             "train/value_loss": sum(value_losses) / len(value_losses),
+            "train/value_prediction_magnitude": sum(val_magnitudes) / len(val_magnitudes),
             "selfplay/avg_game_length": avg_game_length,
-            "speed/fps": int(len(minibatches) * config.training_batch_size / (loop_elapsed_time + 1e-8)),
+            "selfplay/search_confidence_max_visits": avg_max_visits,
+            "selfplay/legal_moves_percentage": avg_legal_pct,
+            "speed/fps": int((len(minibatches) * config.training_batch_size) / (loop_elapsed_time + 1e-8)),
             **buffer_metrics
-        })
+        }
+        wandb.log(log)
+        log_str = ", ".join([f"{k}: {v}" for k, v in log.items()])
+        print(log_str)
 
 
 def make_data_loader(config, num_devices):
@@ -676,13 +854,13 @@ def make_data_loader(config, num_devices):
             buffer_value = command_or_samples["buffer_value"]
             buffer_mask = command_or_samples["buffer_mask"]
             print(f"[Buffer Restore] Loaded {buffer_obs.shape[0]} historical frames into RAM.")
-            yield "LOAD_OK"
+            # yield "LOAD_OK"
             continue
         # --------------------------------
 
         # Map to standard processing if it's a structural Sample container
         samples = command_or_samples
-        
+
         # Pull sharded device data back to CPU host RAM
         samples = jax.device_get(samples)
 
@@ -716,7 +894,7 @@ def make_data_loader(config, num_devices):
         current_buffer_size = buffer_obs.shape[0]
         buffer_metrics = {
             "replay_buffer/size": current_buffer_size,
-            "replay_buffer/saturation_pct": (current_buffer_size / max_capacity) * 100.0
+            "replay_buffer/saturation_pct": (current_buffer_size / max_capacity)
         }
 
         # Calculate updates based strictly on the fresh data volume that just arrived
@@ -729,7 +907,7 @@ def make_data_loader(config, num_devices):
             continue
 
         total_required_elements = num_updates * config.training_batch_size
-        
+
         # Warmup Check: Ensure buffer has enough data before sampling begins
         if current_buffer_size < max(total_required_elements, config.training_batch_size * 2):
             yield None, buffer_metrics
@@ -811,7 +989,6 @@ def save_checkpoint(ckpt_dir, filename, dic):
     ckpt_path = os.path.join(ckpt_dir, filename)
     with open(ckpt_path, "wb") as f:
         pickle.dump(dic, f)
-    print(f"Checkpoint successfully exported to {ckpt_path}")
 
 
 if __name__ == "__main__":
