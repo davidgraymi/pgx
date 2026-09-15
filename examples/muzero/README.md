@@ -30,7 +30,7 @@ and after each month. Each save reports retained games, month coverage, action
 coverage, and action entropy, so an interrupted run still leaves a usable dataset.
 The default chess run uses a smaller network, eight self-play games per batch,
 64 search simulations, and a 50,000-position host replay buffer for a 6 GB GPU.
-`training_mode=pipeline` first trains on `data/sl_dataset.npz`, plays 64 balanced
+`training_mode=pipeline` first trains on `data/sl_dataset.npz`, plays 512 balanced
 games against a uniform random player, and starts RL only when the score reaches
 `supervised_min_random_score`. Set `require_random_win=false` to bypass that gate.
 The pipeline reports the same random-opponent evaluation before and after
@@ -40,6 +40,9 @@ samples moves.
 Supervised training runs up to `supervised_epochs`, stopping when held-out loss
 fails to improve for `supervised_validation_patience` epochs and restoring the
 best validation-loss model. Training entropy and accuracy are logged only.
+The supervised policy uses 5% label smoothing, AdamW weight decay, and game
+result targets for the value head. Validation metrics are broken down by phase
+and color, while random-opponent evaluations report White and Black scores.
 
 Checkpoints contain model and optimizer state only. The replay buffer is stored
 once as `replay_buffer.pkl` beside the checkpoints and overwritten in place;

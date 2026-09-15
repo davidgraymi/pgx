@@ -71,12 +71,15 @@ class Config(BaseModel):
     supervised_epochs: int = 20
     supervised_validation_patience: int = 5
     supervised_validation_min_delta: float = 0.01
-    supervised_eval_games: int = 64
+    supervised_label_smoothing: float = 0.05
+    supervised_weight_decay: float = 0.0001
+    supervised_value_loss_weight: float = 0.5
+    supervised_eval_games: int = 512
     supervised_min_random_score: float = 0.55
     require_random_win: bool = True
     # eval params
     eval_interval: int = 10
-    eval_games: int = 64
+    eval_games: int = 512
     eval_batch_size: int = 8
     replay_buffer_path: str | None = None
     model_config = ConfigDict(extra="forbid")
@@ -103,6 +106,10 @@ def forward_fn(x, is_eval=False):
 
 forward = hk.without_apply_rng(hk.transform_with_state(forward_fn))
 optimizer = optax.adam(learning_rate=config.learning_rate)
+supervised_optimizer = optax.adamw(
+    learning_rate=config.learning_rate,
+    weight_decay=config.supervised_weight_decay,
+)
 
 
 def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.State):
@@ -417,6 +424,7 @@ def run_random_evaluation(rng_key, model, num_games):
         lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
     )
     results = []
+    result_players = []
     for start in range(0, num_games, config.eval_batch_size):
         rng_key, eval_key = jax.random.split(rng_key)
         keys = jax.random.split(eval_key, num_devices)
@@ -424,22 +432,33 @@ def run_random_evaluation(rng_key, model, num_games):
         players = jax.device_put(players.reshape(num_devices, local_batch_size))
         result = evaluate_vs_random(keys, sharded_model, players)
         results.append(np.asarray(jax.device_get(result)).reshape(-1))
+        result_players.append(np.asarray(players).reshape(-1))
 
     del sharded_model
     results = np.concatenate(results)
-    wins = int(np.sum(results == 1))
-    draws = int(np.sum(results == 0))
-    losses = int(np.sum(results == -1))
-    return {
-        "games": int(results.size),
-        "wins": wins,
-        "draws": draws,
-        "losses": losses,
-        "win_rate": wins / results.size,
-        "draw_rate": draws / results.size,
-        "loss_rate": losses / results.size,
-        "score": (wins + 0.5 * draws) / results.size,
-    }, rng_key
+    result_players = np.concatenate(result_players)
+
+    def summarize(selected_results):
+        wins = int(np.sum(selected_results == 1))
+        draws = int(np.sum(selected_results == 0))
+        losses = int(np.sum(selected_results == -1))
+        return {
+            "games": int(selected_results.size),
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "win_rate": wins / selected_results.size,
+            "draw_rate": draws / selected_results.size,
+            "loss_rate": losses / selected_results.size,
+            "score": (wins + 0.5 * draws) / selected_results.size,
+        }
+
+    stats = summarize(results)
+    stats["by_color"] = {
+        "white": summarize(results[result_players == 0]),
+        "black": summarize(results[result_players == 1]),
+    }
+    return stats, rng_key
 
 
 def report_random_evaluation(rng_key, model, num_games, label):
@@ -450,98 +469,95 @@ def report_random_evaluation(rng_key, model, num_games, label):
         f"{label}/draw_rate": stats["draw_rate"],
         f"{label}/loss_rate": stats["loss_rate"],
         f"{label}/score": stats["score"],
+        f"{label}/white/score": stats["by_color"]["white"]["score"],
+        f"{label}/black/score": stats["by_color"]["black"]["score"],
     })
     print(
         f"[{label.upper()}] {stats['games']} games vs random | "
         f"W/D/L {stats['wins']}/{stats['draws']}/{stats['losses']} | "
-        f"score {stats['score']:.2%}"
+        f"score {stats['score']:.2%} | "
+        f"White {stats['by_color']['white']['score']:.2%} | "
+        f"Black {stats['by_color']['black']['score']:.2%}"
     )
     return stats, rng_key
 
 
-def supervised_loss_fn(model_params, model_state, obs, target_actions):
-    """Computes categorical cross-entropy and tracking metrics against expert actions."""
-    # Forward pass through your network
-    (logits, _), model_state = forward.apply(
+def supervised_loss_fn(model_params, model_state, obs, target_actions, target_values):
+    (logits, value), model_state = forward.apply(
         model_params, model_state, obs, is_eval=False
     )
-    
-    # Calculate cross entropy
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_actions)
-    loss = jnp.mean(loss)
-    
-    # --- CALCULATE METRICS ---
-    # Top-1 Accuracy: Does the argmax match the target?
+    action_targets = jax.nn.one_hot(target_actions, logits.shape[-1], dtype=logits.dtype)
+    smoothing = config.supervised_label_smoothing
+    action_targets = (1.0 - smoothing) * action_targets + smoothing / logits.shape[-1]
+    policy_loss = jnp.mean(optax.softmax_cross_entropy(logits, action_targets))
+    value_loss = jnp.mean(optax.l2_loss(value, target_values))
+    loss = policy_loss + config.supervised_value_loss_weight * value_loss
     predictions = jnp.argmax(logits, axis=-1)
     top1_acc = jnp.mean(predictions == target_actions)
-    
-    # Top-5 Accuracy: Is the target action in the top 5 predicted logits?
-    # jax.lax.top_k returns values and indices; we just need the indices
     _, top5_indices = jax.lax.top_k(logits, k=5)
-    # Check if target matches any of the 5 columns along the last axis
     top5_acc = jnp.mean(jnp.any(top5_indices == target_actions[:, None], axis=-1))
-    
-    # Policy Entropy: Measures model confidence (-sum(p * log(p)))
     probs = jax.nn.softmax(logits, axis=-1)
-    # Add a tiny epsilon to prevent log(0)
     entropy = -jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1)
-    mean_entropy = jnp.mean(entropy)
-    
-    # Bundle metrics into a custom dictionary inside your auxiliary payload
     metrics = {
         "loss": loss,
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
         "top1_accuracy": top1_acc,
         "top5_accuracy": top5_acc,
-        "entropy": mean_entropy
+        "entropy": jnp.mean(entropy),
     }
-    
-    # Return the loss scalar first, and the updated state + metrics as a tuple for has_aux
     return loss, (model_state, metrics)
 
 
 @partial(jax.pmap, axis_name="i")
-def supervised_train_step(model, opt_state, obs, target_actions):
-    """A parallelized parameter update optimization step for supervised learning."""
+def supervised_train_step(model, opt_state, obs, target_actions, target_values):
     model_params, model_state = model
-    
-    # Capture the nested dictionary from has_aux
     (loss, (model_state, metrics)), grads = jax.value_and_grad(supervised_loss_fn, has_aux=True)(
-        model_params, model_state, obs, target_actions
+        model_params, model_state, obs, target_actions, target_values
     )
-    
-    # Average gradients and your custom metric dictionary values across all cores
     grads = jax.lax.pmean(grads, axis_name="i")
     metrics = jax.lax.pmean(metrics, axis_name="i")
-    
-    # Apply standard optimizer updates
-    updates, opt_state = optimizer.update(grads, opt_state)
+    updates, opt_state = supervised_optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
-    
     return (model_params, model_state), opt_state, metrics
 
 
 @jax.pmap
-def supervised_validation_step(model, obs, target_actions):
+def supervised_validation_step(model, obs, target_actions, target_values):
     model_params, model_state = model
-    (logits, _), _ = forward.apply(model_params, model_state, obs, is_eval=True)
-    loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, target_actions))
-    top1_accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == target_actions)
+    (logits, value), _ = forward.apply(model_params, model_state, obs, is_eval=True)
+    policy_loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_actions)
+    value_loss = optax.l2_loss(value, target_values)
     _, top5_indices = jax.lax.top_k(logits, k=5)
-    top5_accuracy = jnp.mean(jnp.any(top5_indices == target_actions[:, None], axis=-1))
-    return {"loss": loss, "top1_accuracy": top1_accuracy, "top5_accuracy": top5_accuracy}
+    return {
+        "loss": policy_loss + config.supervised_value_loss_weight * value_loss,
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "top1_accuracy": jnp.argmax(logits, axis=-1) == target_actions,
+        "top5_accuracy": jnp.any(top5_indices == target_actions[:, None], axis=-1),
+    }
 
 
 def load_supervised_dataset(path):
     if path.endswith(".npz"):
         with np.load(path) as dataset:
-            return np.asarray(dataset["observations"]), np.asarray(dataset["actions"])
+            observations = np.asarray(dataset["observations"])
+            actions = np.asarray(dataset["actions"])
+            values = np.asarray(dataset["values"]) if "values" in dataset.files else np.zeros(actions.shape[0], dtype=np.float32)
+            phases = np.asarray(dataset["sample_phases"]) if "sample_phases" in dataset.files else np.full(actions.shape[0], "unknown")
+            players = np.asarray(dataset["players"]) if "players" in dataset.files else np.full(actions.shape[0], -1, dtype=np.int8)
+            return observations, actions, values, phases, players
     with open(path, "rb") as f:
         dataset = pickle.load(f)
-    return np.asarray(dataset["observations"]), np.asarray(dataset["actions"])
-
+    observations = np.asarray(dataset["observations"])
+    actions = np.asarray(dataset["actions"])
+    values = np.asarray(dataset.get("values", np.zeros(actions.shape[0], dtype=np.float32)))
+    phases = np.asarray(dataset.get("sample_phases", np.full(actions.shape[0], "unknown")))
+    players = np.asarray(dataset.get("players", np.full(actions.shape[0], -1, dtype=np.int8)))
+    return observations, actions, values, phases, players
 
 def run_supervised_training(config, model, opt_state, num_devices, sharding, ckpt_dir):
-    """Executes human expert pre-training, pulling slices to the GPU dynamically from CPU memory."""
+    """Train the policy and value heads on expert games with held-out validation."""
     sl_dataset_path = config.sl_dataset_path
     if not os.path.exists(sl_dataset_path) and sl_dataset_path.endswith(".npz"):
         sl_dataset_path = sl_dataset_path[:-4] + ".pkl"
@@ -550,24 +566,30 @@ def run_supervised_training(config, model, opt_state, num_devices, sharding, ckp
         return model, opt_state
 
     print("Found dataset! Commencing Supervised Pre-Training...")
-    sl_obs, sl_actions = load_supervised_dataset(sl_dataset_path)
-    validation_obs = validation_actions = None
+    sl_obs, sl_actions, sl_values, _, _ = load_supervised_dataset(sl_dataset_path)
+    validation_obs = validation_actions = validation_values = None
+    validation_phases = validation_players = None
     validation_path = config.sl_validation_path
     if not os.path.exists(validation_path) and validation_path.endswith(".npz"):
         validation_path = validation_path[:-4] + ".pkl"
     if os.path.exists(validation_path):
-        validation_obs, validation_actions = load_supervised_dataset(validation_path)
+        (
+            validation_obs,
+            validation_actions,
+            validation_values,
+            validation_phases,
+            validation_players,
+        ) = load_supervised_dataset(validation_path)
         print(f"Found held-out validation set with {validation_obs.shape[0]} positions.")
     else:
         print(f"Validation dataset not found at {validation_path}.")
 
-
-    # Replicate core model weights across devices
     sl_model = jax.tree_util.tree_map(
         lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
     )
+    supervised_opt_state = supervised_optimizer.init(params=model[0])
     sl_opt_state = jax.tree_util.tree_map(
-        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), opt_state
+        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), supervised_opt_state
     )
 
     num_samples = sl_obs.shape[0]
@@ -587,40 +609,37 @@ def run_supervised_training(config, model, opt_state, num_devices, sharding, ckp
     for epoch in range(config.supervised_epochs):
         indices = sl_rng.permutation(num_samples)
         epoch_loss = 0.0
-
-        for b in range(num_batches):
+        for batch_number in range(num_batches):
             st = time.time()
-            batch_idx = indices[b * sl_batch_size : (b + 1) * sl_batch_size]
-            
-            # Reshape on host CPU to partition across devices cleanly
+            batch_idx = indices[batch_number * sl_batch_size : (batch_number + 1) * sl_batch_size]
             raw_obs = sl_obs[batch_idx]
             raw_actions = sl_actions[batch_idx]
-            reshaped_obs = raw_obs.reshape(num_devices, sl_batch_size // num_devices, *raw_obs.shape[1:])
-            reshaped_actions = raw_actions.reshape(num_devices, sl_batch_size // num_devices, *raw_actions.shape[1:])
-            
-            batch_obs = jax.device_put(reshaped_obs)
-            batch_actions = jax.device_put(reshaped_actions)
-
-            sl_model, sl_opt_state, sharded_metrics = supervised_train_step(
-                sl_model, sl_opt_state, batch_obs, batch_actions
+            raw_values = sl_values[batch_idx]
+            batch_obs = jax.device_put(
+                raw_obs.reshape(num_devices, sl_batch_size // num_devices, *raw_obs.shape[1:])
             )
-
+            batch_actions = jax.device_put(
+                raw_actions.reshape(num_devices, sl_batch_size // num_devices)
+            )
+            batch_values = jax.device_put(
+                raw_values.reshape(num_devices, sl_batch_size // num_devices)
+            )
+            sl_model, sl_opt_state, sharded_metrics = supervised_train_step(
+                sl_model, sl_opt_state, batch_obs, batch_actions, batch_values
+            )
             processed_metrics = {
-                f"supervised/{k}": float(jax.device_get(jnp.mean(v)))
-                for k, v in sharded_metrics.items()
+                f"supervised/{key}": float(jax.device_get(jnp.mean(value)))
+                for key, value in sharded_metrics.items()
             }
-            step_loss = processed_metrics.get("supervised/loss", 0.0)
-            epoch_loss += step_loss
+            epoch_loss += processed_metrics["supervised/loss"]
             global_step += 1
             hours += (time.time() - st) / 3600
-
-            log = {
+            wandb.log({
                 "supervised/epoch": epoch + 1,
                 "supervised/global_step": global_step,
                 "hours": hours,
-                **processed_metrics
-            }
-            wandb.log(log)
+                **processed_metrics,
+            })
 
         avg_epoch_loss = epoch_loss / num_batches
         epoch_log = {
@@ -628,66 +647,86 @@ def run_supervised_training(config, model, opt_state, num_devices, sharding, ckp
             "supervised/epoch": epoch + 1,
             "hours": hours,
         }
-        if validation_obs is not None:
-            validation_batch_size = min(config.training_batch_size, validation_obs.shape[0])
-            validation_batch_size -= validation_batch_size % num_devices
-            if validation_batch_size == 0:
-                raise ValueError("The validation dataset must contain at least one sample per device")
-            validation_num_batches = validation_obs.shape[0] // validation_batch_size
-            validation_totals = {"loss": 0.0, "top1_accuracy": 0.0, "top5_accuracy": 0.0}
-            for validation_batch in range(validation_num_batches):
-                start = validation_batch * validation_batch_size
-                end = start + validation_batch_size
-                batch_obs = jax.device_put(
-                    validation_obs[start:end].reshape(
-                        num_devices, validation_batch_size // num_devices, *validation_obs.shape[1:]
-                    )
-                )
-                batch_actions = jax.device_put(
-                    validation_actions[start:end].reshape(
-                        num_devices, validation_batch_size // num_devices
-                    )
-                )
-                metrics = supervised_validation_step(sl_model, batch_obs, batch_actions)
-                for key, value in metrics.items():
-                    validation_totals[key] += float(jax.device_get(jnp.mean(value)))
-            validation_metrics = {
-                f"supervised/validation_{key}": value / validation_num_batches
-                for key, value in validation_totals.items()
-            }
-            current_validation_loss = validation_metrics["supervised/validation_loss"]
-            if current_validation_loss < best_validation_loss - config.supervised_validation_min_delta:
-                best_validation_loss = current_validation_loss
-                best_validation_epoch = epoch + 1
-                validation_epochs_without_improvement = 0
-                best_model = jax.tree_util.tree_map(
-                    lambda value: np.array(jax.device_get(value[0]), copy=True), sl_model
-                )
-                best_opt_state = jax.tree_util.tree_map(
-                    lambda value: np.array(jax.device_get(value[0]), copy=True), sl_opt_state
-                )
-                epoch_log["supervised/validation_best_loss"] = best_validation_loss
-            else:
-                validation_epochs_without_improvement += 1
-            epoch_log["supervised/validation_epochs_without_improvement"] = (
-                validation_epochs_without_improvement
-            )
-            epoch_log.update(validation_metrics)
-            print(
-                f"Supervised Epoch {epoch + 1} Complete | Loss: {avg_epoch_loss:.4f} | "
-                f"Validation Loss: {validation_metrics['supervised/validation_loss']:.4f} | "
-                f"Validation Top-1: {validation_metrics['supervised/validation_top1_accuracy']:.2%}"
-            )
-            if validation_epochs_without_improvement >= config.supervised_validation_patience:
-                print(
-                    f"Validation loss stopped improving for {config.supervised_validation_patience} "
-                    f"epochs; restoring epoch {best_validation_epoch}."
-                )
-                wandb.log(epoch_log)
-                break
-        else:
+        if validation_obs is None:
             print(f"Supervised Epoch {epoch + 1} Complete | Average Loss: {avg_epoch_loss:.4f}")
+            wandb.log(epoch_log)
+            continue
+
+        validation_batch_size = min(config.training_batch_size, validation_obs.shape[0])
+        validation_batch_size -= validation_batch_size % num_devices
+        if validation_batch_size == 0:
+            raise ValueError("The validation dataset must contain at least one sample per device")
+        validation_num_batches = validation_obs.shape[0] // validation_batch_size
+        validation_values_by_metric = {key: [] for key in ("loss", "policy_loss", "value_loss", "top1_accuracy", "top5_accuracy")}
+        validation_phase_labels = []
+        validation_player_labels = []
+        for batch_number in range(validation_num_batches):
+            start = batch_number * validation_batch_size
+            end = start + validation_batch_size
+            batch_obs = jax.device_put(
+                validation_obs[start:end].reshape(
+                    num_devices, validation_batch_size // num_devices, *validation_obs.shape[1:]
+                )
+            )
+            batch_actions = jax.device_put(
+                validation_actions[start:end].reshape(num_devices, validation_batch_size // num_devices)
+            )
+            batch_values = jax.device_put(
+                validation_values[start:end].reshape(num_devices, validation_batch_size // num_devices)
+            )
+            metrics = supervised_validation_step(sl_model, batch_obs, batch_actions, batch_values)
+            for key, value in metrics.items():
+                validation_values_by_metric[key].append(np.asarray(jax.device_get(value)).reshape(-1))
+            validation_phase_labels.append(validation_phases[start:end])
+            validation_player_labels.append(validation_players[start:end])
+
+        validation_arrays = {
+            key: np.concatenate(values) for key, values in validation_values_by_metric.items()
+        }
+        validation_metrics = {
+            f"supervised/validation_{key}": float(np.mean(value))
+            for key, value in validation_arrays.items()
+        }
+        validation_phase_labels = np.concatenate(validation_phase_labels)
+        validation_player_labels = np.concatenate(validation_player_labels)
+        for phase in ("opening", "middlegame", "endgame"):
+            mask = validation_phase_labels == phase
+            if np.any(mask):
+                epoch_log[f"supervised/validation_phase/{phase}/loss"] = float(np.mean(validation_arrays["loss"][mask]))
+                epoch_log[f"supervised/validation_phase/{phase}/top1_accuracy"] = float(np.mean(validation_arrays["top1_accuracy"][mask]))
+        for player, name in ((0, "white"), (1, "black")):
+            mask = validation_player_labels == player
+            if np.any(mask):
+                epoch_log[f"supervised/validation_color/{name}/loss"] = float(np.mean(validation_arrays["loss"][mask]))
+                epoch_log[f"supervised/validation_color/{name}/top1_accuracy"] = float(np.mean(validation_arrays["top1_accuracy"][mask]))
+        current_validation_loss = validation_metrics["supervised/validation_loss"]
+        if current_validation_loss < best_validation_loss - config.supervised_validation_min_delta:
+            best_validation_loss = current_validation_loss
+            best_validation_epoch = epoch + 1
+            validation_epochs_without_improvement = 0
+            best_model = jax.tree_util.tree_map(
+                lambda value: np.array(jax.device_get(value[0]), copy=True), sl_model
+            )
+            best_opt_state = jax.tree_util.tree_map(
+                lambda value: np.array(jax.device_get(value[0]), copy=True), sl_opt_state
+            )
+            epoch_log["supervised/validation_best_loss"] = best_validation_loss
+        else:
+            validation_epochs_without_improvement += 1
+        epoch_log["supervised/validation_epochs_without_improvement"] = validation_epochs_without_improvement
+        epoch_log.update(validation_metrics)
+        print(
+            f"Supervised Epoch {epoch + 1} Complete | Loss: {avg_epoch_loss:.4f} | "
+            f"Validation Loss: {validation_metrics['supervised/validation_loss']:.4f} | "
+            f"Validation Top-1: {validation_metrics['supervised/validation_top1_accuracy']:.2%}"
+        )
         wandb.log(epoch_log)
+        if validation_epochs_without_improvement >= config.supervised_validation_patience:
+            print(
+                f"Validation loss stopped improving for {config.supervised_validation_patience} "
+                f"epochs; restoring epoch {best_validation_epoch}."
+            )
+            break
 
     jax.effects_barrier()
     if best_model is not None:
@@ -695,14 +734,10 @@ def run_supervised_training(config, model, opt_state, num_devices, sharding, ckp
     else:
         model = jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), sl_model)
         opt_state = jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), sl_opt_state)
-
-    # Save structural checkpoint so this phase can be skipped on future runs
     sl_weights = os.path.join(ckpt_dir, "sl_weights.pkl")
     with open(sl_weights, "wb") as f:
         pickle.dump(model, f)
-
     return model, opt_state
-
 
 def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, iteration, frames, hours, rng_key, buffer_state, replay_buffer_path):
     """Executes the core MuZero RL continuum using dynamic history sampling."""
@@ -1208,6 +1243,7 @@ if __name__ == "__main__":
                 f"Required score: {config.supervised_min_random_score:.2%}."
             )
             raise SystemExit(0)
+        opt_state = optimizer.init(params=model[0])
 
     if config.training_mode in ("rl", "pipeline"):
         run_rl_training(

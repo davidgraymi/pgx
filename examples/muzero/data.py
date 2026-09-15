@@ -139,9 +139,9 @@ class StratifiedReservoir:
             values.pop(index)
         self.phase_counts[phase] -= 1
 
-    def add(self, observation, action, month, game_id, phase, opening):
+    def add(self, observation, action, month, game_id, phase, opening, value, player):
         key = (phase, opening)
-        bucket = self.buckets.setdefault(key, {"obs": [], "actions": [], "months": [], "games": [], "phases": []})
+        bucket = self.buckets.setdefault(key, {"obs": [], "actions": [], "months": [], "games": [], "phases": [], "values": [], "players": []})
         seen = self.seen.get(key, 0) + 1
         self.seen[key] = seen
         capacity = max(1, self.phase_capacities[phase] // self.opening_buckets)
@@ -149,19 +149,19 @@ class StratifiedReservoir:
             index = self.rng.integers(seen)
             if index >= capacity:
                 return
-            values = (observation, action, month, game_id, phase)
-            bucket["obs"][index], bucket["actions"][index], bucket["months"][index], bucket["games"][index], bucket["phases"][index] = values
+            values = (observation, action, month, game_id, phase, value, player)
+            bucket["obs"][index], bucket["actions"][index], bucket["months"][index], bucket["games"][index], bucket["phases"][index], bucket["values"][index], bucket["players"][index] = values
             return
 
-        values = (observation, action, month, game_id, phase)
-        for name, value in zip(("obs", "actions", "months", "games", "phases"), values):
-            bucket[name].append(value)
+        values = (observation, action, month, game_id, phase, value, player)
+        for name, item in zip(("obs", "actions", "months", "games", "phases", "values", "players"), values):
+            bucket[name].append(item)
         self.phase_counts[phase] += 1
         if self.phase_counts[phase] > self.phase_capacities[phase]:
             self._remove_random(phase, key)
 
     def flatten(self):
-        observations, actions, months, games, phases, openings = [], [], [], [], [], []
+        observations, actions, months, games, phases, openings, values, players = [], [], [], [], [], [], [], []
         for phase in self.phases:
             for (bucket_phase, opening), bucket in sorted(self.buckets.items()):
                 if bucket_phase != phase:
@@ -171,8 +171,10 @@ class StratifiedReservoir:
                 months.extend(bucket["months"])
                 games.extend(bucket["games"])
                 phases.extend(bucket["phases"])
+                values.extend(bucket["values"])
+                players.extend(bucket["players"])
                 openings.extend([opening] * len(bucket["obs"]))
-        return observations, actions, months, games, phases, openings
+        return observations, actions, months, games, phases, openings, values, players
 
     def __len__(self):
         return sum(len(bucket["obs"]) for bucket in self.buckets.values())
@@ -186,6 +188,8 @@ def save_dataset_checkpoint(
     sample_game_ids,
     sample_phases,
     sample_openings,
+    sample_values,
+    sample_players,
     positions_seen: int,
     games_seen: int,
     reason: str,
@@ -204,7 +208,7 @@ def save_dataset_checkpoint(
     phase_counts = {phase: sample_phases.count(phase) for phase in ("opening", "middlegame", "endgame")}
 
     metadata = {
-        "format_version": 5,
+        "format_version": 6,
         "split": split,
         "positions_seen": positions_seen,
         "games_seen": games_seen,
@@ -212,6 +216,8 @@ def save_dataset_checkpoint(
         "sample_game_ids": np.asarray(sample_game_ids, dtype=np.int64),
         "sample_phases": np.asarray(sample_phases),
         "sample_openings": np.asarray(sample_openings),
+        "values": np.asarray(sample_values, dtype=np.float32),
+        "players": np.asarray(sample_players, dtype=np.int8),
     }
     temporary_path = output_path + ".tmp"
     if output_path.endswith(".npz"):
@@ -250,7 +256,7 @@ def _dataset_is_current(path: str, min_positions: int) -> bool:
                 dataset = pickle.load(f)
             positions = dataset["observations"].shape[0]
             version = dataset.get("format_version", 0)
-        return positions >= min_positions and version >= 5
+        return positions >= min_positions and version >= 6
     except (OSError, KeyError, ValueError, pickle.PickleError):
         return False
 
@@ -337,6 +343,8 @@ def download_and_preprocess(
             opening = str(game.headers.get("ECO", "")).strip()
             if not opening or opening in {"?", "-"}:
                 opening = f"unknown_{games_seen % train_reservoir.opening_buckets:02d}"
+            result = game.headers.get("Result", "*")
+            white_value = {"1-0": 1.0, "0-1": -1.0}.get(result, 0.0)
 
             for ply, move in enumerate(game.mainline_moves()):
                 try:
@@ -365,7 +373,11 @@ def download_and_preprocess(
                     phase = "endgame"
                 else:
                     phase = "middlegame"
-                target_reservoir.add(observation, action, month, games_seen, phase, opening)
+                player = int(np.asarray(state.current_player))
+                value = white_value if player == 0 else -white_value
+                target_reservoir.add(
+                    observation, action, month, games_seen, phase, opening, value, player
+                )
                 added += 1
 
                 if positions_seen - last_saved_positions >= save_interval_positions:
