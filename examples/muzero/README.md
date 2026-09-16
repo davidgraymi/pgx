@@ -49,6 +49,8 @@ once as `replay_buffer.pkl` beside the checkpoints and overwritten in place;
 override it with `replay_buffer_path=...` when resuming a run.
 RL uses a 50,000-position ring buffer, samples it without copying the whole
 buffer, and bootstraps value targets for rollouts that reach the step limit.
+W&B also records separate self-play, training, and whole-loop FPS, termination
+and truncation rates, value-target statistics, update counts, and replay-sample age.
 
 Useful resource controls:
 

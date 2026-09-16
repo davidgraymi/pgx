@@ -144,6 +144,7 @@ class SelfplayOutput(NamedTuple):
     obs: jnp.ndarray
     reward: jnp.ndarray
     terminated: jnp.ndarray
+    truncated: jnp.ndarray
     bootstrap_value: jnp.ndarray
     action_weights: jnp.ndarray
     discount: jnp.ndarray
@@ -212,6 +213,7 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             action_weights=policy_output.action_weights,
             reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor],
             terminated=state.terminated,
+            truncated=state.truncated,
             bootstrap_value=bootstrap_value,
             discount=discount,
             max_visits=max_root_visits,
@@ -238,7 +240,8 @@ class Sample(NamedTuple):
 @jax.pmap
 def compute_loss_input(data: SelfplayOutput) -> Sample:
     batch_size = config.selfplay_batch_size // num_devices
-    terminals_before = jnp.cumsum(data.terminated, axis=0) - data.terminated
+    done = data.terminated | data.truncated
+    terminals_before = jnp.cumsum(done, axis=0) - done
     value_mask = terminals_before == 0
 
     def body_fn(carry, i):
@@ -262,6 +265,19 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
         value_tgt=value_tgt,
         mask=value_mask,
     )
+
+
+def rollout_metrics(data: SelfplayOutput, samples: Sample):
+    terminated = np.asarray(jax.device_get(data.terminated))
+    truncated = np.asarray(jax.device_get(data.truncated))
+    mask = np.asarray(jax.device_get(samples.mask))
+    value_targets = np.asarray(jax.device_get(samples.value_tgt))[mask]
+    return {
+        "selfplay/termination_rate": float(terminated.mean()),
+        "selfplay/truncation_rate": float(truncated.mean()),
+        "value_target/mean": float(value_targets.mean()) if value_targets.size else 0.0,
+        "value_target/std": float(value_targets.std()) if value_targets.size else 0.0,
+    }
 
 
 def loss_fn(model_params, model_state, samples: Sample):
@@ -831,6 +847,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         steps_per_game = jax.device_get(samples.mask.sum(axis=2))
         avg_game_length = float(steps_per_game.mean())
         frames += int(steps_per_game.sum())
+        rollout_log = rollout_metrics(data, samples)
         
         # Send data to see if buffer clears its internal warmup size thresholds
         if not loader_ready:
@@ -855,6 +872,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             "frames": frames,
             "selfplay/avg_game_length": avg_game_length,
             "speed/fps": 0,
+            **rollout_log,
             **buffer_metrics
         })
 
@@ -978,6 +996,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             break
 
         loop_start_time = time.time()
+        training_start_time = loop_start_time
         policy_losses, value_losses, val_magnitudes = [], [], []
         sharded_minibatches = [jax.device_put(b) for b in minibatches]
 
@@ -987,9 +1006,12 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             value_losses.append(value_loss.mean().item())
             val_magnitudes.append(v_mag.mean().item())
 
+        training_elapsed_time = time.time() - training_start_time
+
         iteration += 1
 
         # Re-Generate Fresh Samples for the next iteration cycle
+        selfplay_start_time = time.time()
         rng_key, subkey = jax.random.split(rng_key)
         keys = jax.random.split(subkey, num_devices)
         data: SelfplayOutput = selfplay(model, keys)
@@ -1004,7 +1026,12 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
 
         steps_per_game = samples.mask.sum(axis=2)
         avg_game_length = float(steps_per_game.mean())
-        frames += int(steps_per_game.sum())
+        selfplay_frames = int(steps_per_game.sum())
+        frames += selfplay_frames
+        rollout_terminated = int(np.asarray(jax.device_get(data.terminated)).sum())
+        rollout_truncated = int(np.asarray(jax.device_get(data.truncated)).sum())
+        rollout_steps = int(np.asarray(jax.device_get(data.terminated)).size)
+        rollout_log = rollout_metrics(data, samples)
 
         next(data_loader)
         minibatches, buffer_metrics = data_loader.send(samples)
@@ -1017,17 +1044,27 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             data: SelfplayOutput = selfplay(model, keys)
             samples = compute_loss_input(data)
             steps_per_game = jax.device_get(samples.mask.sum(axis=2))
+            selfplay_frames += int(steps_per_game.sum())
             frames += int(steps_per_game.sum())
+            rollout_terminated += int(np.asarray(jax.device_get(data.terminated)).sum())
+            rollout_truncated += int(np.asarray(jax.device_get(data.truncated)).sum())
+            rollout_steps += int(np.asarray(jax.device_get(data.terminated)).size)
             next(data_loader)
             minibatches, buffer_metrics = data_loader.send(samples)
 
         loop_elapsed_time = time.time() - loop_start_time
+        selfplay_elapsed_time = time.time() - selfplay_start_time
         hours += loop_elapsed_time / 3600
+        rollout_log["selfplay/termination_rate"] = rollout_terminated / rollout_steps
+        rollout_log["selfplay/truncation_rate"] = rollout_truncated / rollout_steps
 
         policy_loss = sum(policy_losses) / len(policy_losses)
         value_loss = sum(value_losses) / len(value_losses)
         value_magnitude = sum(val_magnitudes) / len(val_magnitudes)
-        speed = int((len(minibatches) * config.training_batch_size) / (loop_elapsed_time + 1e-8))
+        updates_completed = len(sharded_minibatches)
+        selfplay_fps = int(selfplay_frames / (selfplay_elapsed_time + 1e-8))
+        train_fps = int((updates_completed * config.training_batch_size) / (training_elapsed_time + 1e-8))
+        loop_fps = int(selfplay_frames / (loop_elapsed_time + 1e-8))
         log = {
             "iteration": iteration,
             "hours": hours,
@@ -1035,10 +1072,15 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             "train/policy_loss": policy_loss,
             "train/value_loss": value_loss,
             "train/value_prediction_magnitude": value_magnitude,
+            "train/updates": updates_completed,
             "selfplay/avg_game_length": avg_game_length,
             "selfplay/search_confidence_max_visits": avg_max_visits,
             "selfplay/legal_moves_percentage": avg_legal_pct,
-            "speed/fps": speed,
+            "speed/fps": selfplay_fps,
+            "speed/selfplay_fps": selfplay_fps,
+            "speed/train_fps": train_fps,
+            "speed/loop_fps": loop_fps,
+            **rollout_log,
             **buffer_metrics,
         }
         wandb.log(log)
@@ -1057,8 +1099,10 @@ def make_data_loader(config, num_devices):
     rng = np.random.default_rng(config.seed)
     batch_per_device = config.training_batch_size // num_devices
     buffer_obs = buffer_policy = buffer_value = None
+    buffer_sequence = None
     buffer_size = 0
     write_index = 0
+    total_inserted = 0
 
     def allocate(sample_obs, sample_policy, sample_value):
         return (
@@ -1099,9 +1143,11 @@ def make_data_loader(config, num_devices):
                 buffer_obs, buffer_policy, buffer_value = allocate(
                     restored_obs[:1], restored_policy[:1], restored_value[:1]
                 )
+                buffer_sequence = np.arange(max_capacity, dtype=np.int64)
                 buffer_obs[:buffer_size] = restored_obs[-buffer_size:]
                 buffer_policy[:buffer_size] = restored_policy[-buffer_size:]
                 buffer_value[:buffer_size] = restored_value[-buffer_size:]
+                total_inserted = buffer_size
                 write_index = buffer_size % max_capacity
             print(f"[Buffer Restore] Loaded {buffer_size} historical frames into RAM.")
             yield None
@@ -1115,6 +1161,7 @@ def make_data_loader(config, num_devices):
 
         if valid_obs.shape[0] and buffer_obs is None:
             buffer_obs, buffer_policy, buffer_value = allocate(valid_obs, valid_policy, valid_value)
+            buffer_sequence = np.empty(max_capacity, dtype=np.int64)
 
         if valid_obs.shape[0]:
             if valid_obs.shape[0] >= max_capacity:
@@ -1126,8 +1173,10 @@ def make_data_loader(config, num_devices):
             buffer_obs[positions] = valid_obs
             buffer_policy[positions] = valid_policy
             buffer_value[positions] = valid_value
+            buffer_sequence[positions] = total_inserted + np.arange(count)
             write_index = (write_index + count) % max_capacity
             buffer_size = min(max_capacity, buffer_size + count)
+            total_inserted += count
 
         buffer_metrics = {
             "replay_buffer/size": buffer_size,
@@ -1144,6 +1193,7 @@ def make_data_loader(config, num_devices):
         sample_indices = rng.choice(buffer_size, size=total_required_elements, replace=False)
         if buffer_size == max_capacity:
             sample_indices = (write_index + sample_indices) % max_capacity
+        sample_ages = total_inserted - 1 - buffer_sequence[sample_indices]
         train_obs = buffer_obs[sample_indices]
         train_policy = buffer_policy[sample_indices]
         train_value = buffer_value[sample_indices]
@@ -1156,6 +1206,8 @@ def make_data_loader(config, num_devices):
                    mask=np.ones((num_devices, batch_per_device), dtype=bool))
             for i in range(num_updates)
         ]
+        buffer_metrics["replay_buffer/sample_age_mean"] = float(np.mean(sample_ages))
+        buffer_metrics["replay_buffer/sample_age_max"] = int(np.max(sample_ages))
         yield batches_list, buffer_metrics
 
 
