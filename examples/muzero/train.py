@@ -294,7 +294,7 @@ def train(model, opt_state, data: Sample):
 
 
 @jax.pmap
-def evaluate(rng_key, my_model, baseline_model, my_player):
+def evaluate(rng_key, my_model, baseline_model, my_color):
     """Evaluates the live learning model against a stable baseline snapshot model."""
     my_model_params, my_model_state = my_model
     base_model_params, base_model_state = baseline_model
@@ -303,6 +303,7 @@ def evaluate(rng_key, my_model, baseline_model, my_player):
     batch_size = config.eval_batch_size // num_devices
     keys = jax.random.split(subkey, batch_size)
     state = jax.vmap(env.init)(keys)
+    my_player = state._player_order[jnp.arange(batch_size), my_color]
 
     def body_fn(val):
         key, state, R = val
@@ -370,7 +371,7 @@ def evaluate_offline_metrics(forward_apply_fn, model_params, model_state, obs_ba
 
 
 @jax.pmap
-def evaluate_vs_random(rng_key, my_model, my_player):
+def evaluate_vs_random(rng_key, my_model, my_color):
     """Evaluates the live learning model against a uniform random legal opponent."""
     my_model_params, my_model_state = my_model
 
@@ -378,6 +379,7 @@ def evaluate_vs_random(rng_key, my_model, my_player):
     batch_size = config.eval_batch_size // num_devices
     keys = jax.random.split(subkey, batch_size)
     state = jax.vmap(env.init)(keys)
+    my_player = state._player_order[jnp.arange(batch_size), my_color]
 
     def body_fn(val):
         key, state, R = val
@@ -428,11 +430,11 @@ def run_random_evaluation(rng_key, model, num_games):
     for start in range(0, num_games, config.eval_batch_size):
         rng_key, eval_key = jax.random.split(rng_key)
         keys = jax.random.split(eval_key, num_devices)
-        players = np.arange(start, start + config.eval_batch_size, dtype=np.int32)
-        players = jax.device_put(players.reshape(num_devices, local_batch_size))
-        result = evaluate_vs_random(keys, sharded_model, players)
+        colors = np.arange(start, start + config.eval_batch_size, dtype=np.int32) % 2
+        colors = jax.device_put(colors.reshape(num_devices, local_batch_size))
+        result = evaluate_vs_random(keys, sharded_model, colors)
         results.append(np.asarray(jax.device_get(result)).reshape(-1))
-        result_players.append(np.asarray(players).reshape(-1))
+        result_players.append(np.asarray(colors).reshape(-1))
 
     del sharded_model
     results = np.concatenate(results)
@@ -517,7 +519,7 @@ def supervised_train_step(model, opt_state, obs, target_actions, target_values):
     )
     grads = jax.lax.pmean(grads, axis_name="i")
     metrics = jax.lax.pmean(metrics, axis_name="i")
-    updates, opt_state = supervised_optimizer.update(grads, opt_state)
+    updates, opt_state = supervised_optimizer.update(grads, opt_state, params=model_params)
     model_params = optax.apply_updates(model_params, updates)
     return (model_params, model_state), opt_state, metrics
 
@@ -862,11 +864,11 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), champion_model_cpu
             )
 
-            eval_players = np.arange(config.eval_batch_size, dtype=np.int32) % 2
-            eval_players = jax.device_put(
-                eval_players.reshape(num_devices, config.eval_batch_size // num_devices)
+            eval_colors = np.arange(config.eval_batch_size, dtype=np.int32) % 2
+            eval_colors = jax.device_put(
+                eval_colors.reshape(num_devices, config.eval_batch_size // num_devices)
             )
-            R_champ = evaluate(keys, model, champion_model_sharded, eval_players)
+            R_champ = evaluate(keys, model, champion_model_sharded, eval_colors)
             del champion_model_sharded
 
             win_rate_champ = ((R_champ == 1).sum() / R_champ.size).item()

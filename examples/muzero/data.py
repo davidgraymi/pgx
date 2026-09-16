@@ -373,7 +373,7 @@ def download_and_preprocess(
                     phase = "endgame"
                 else:
                     phase = "middlegame"
-                player = int(np.asarray(state.current_player))
+                player = 0 if board.turn == chess.WHITE else 1
                 value = white_value if player == 0 else -white_value
                 target_reservoir.add(
                     observation, action, month, games_seen, phase, opening, value, player
