@@ -56,14 +56,14 @@ class Config(BaseModel):
     num_layers: int = 4
     resnet_v2: bool = True
     # selfplay params
-    selfplay_batch_size: int = 8
+    selfplay_batch_size: int = 16
     num_simulations: int = 64
     max_num_steps: int = 256
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
     # training params
     training_batch_size: int = 256
-    learning_rate: float = 0.001
+    learning_rate: float = 0.0003
     load_ckpt: str | None = None
     training_mode: str = "pipeline"
     sl_dataset_path: str = "data/sl_dataset.npz"
@@ -801,6 +801,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
 
     data_loader = make_data_loader(config, num_devices)
     next(data_loader)
+    loader_ready = True
 
     if buffer_state is None and replay_buffer_path and os.path.exists(replay_buffer_path):
         with open(replay_buffer_path, "rb") as f:
@@ -809,11 +810,13 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
     if buffer_state is not None:
         print("\n=== Found saved experience history. Restoring Replay Buffer Workspace ===")
         data_loader.send(buffer_state)
+        next(data_loader)
         print("Replay Buffer successfully primed with historical experience arrays.")
 
     print("\n=== Initializing Replay Buffer Warmup ===")
     warmup_batches = None
     buffer_metrics = {}
+    warmup_round = 0
     
     while warmup_batches is None:
         st = time.time()
@@ -830,13 +833,20 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         frames += int(steps_per_game.sum())
         
         # Send data to see if buffer clears its internal warmup size thresholds
-        next(data_loader)
+        if not loader_ready:
+            next(data_loader)
         warmup_batches, buffer_metrics = data_loader.send(samples)
+        loader_ready = False
+        warmup_round += 1
         
         et = time.time()
         hours += (et - st) / 3600
         
-        print(f"[Warmup] Total Accumulated Frames: {frames} | Current Avg Game Length: {avg_game_length:.2f}")
+        print(
+            f"RL Warmup {warmup_round} Complete | Frames: {frames} | "
+            f"Avg Game Length: {avg_game_length:.2f} | "
+            f"Replay: {buffer_metrics.get('replay_buffer/size', 0)}"
+        )
         
         # Log purely environmental data during the warmup stage
         wandb.log({
@@ -871,9 +881,11 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             R_champ = evaluate(keys, model, champion_model_sharded, eval_colors)
             del champion_model_sharded
 
-            win_rate_champ = ((R_champ == 1).sum() / R_champ.size).item()
-            draw_rate_champ = ((R_champ == 0).sum() / R_champ.size).item()
-            lose_rate_champ = ((R_champ == -1).sum() / R_champ.size).item()
+            champion_results = np.asarray(jax.device_get(R_champ)).reshape(-1)
+            champion_wins = int(np.sum(champion_results == 1))
+            champion_draws = int(np.sum(champion_results == 0))
+            champion_losses = int(np.sum(champion_results == -1))
+            champion_score = (champion_wins + 0.5 * champion_draws) / champion_results.size
 
             current_model_cpu = jax.tree_util.tree_map(lambda x: x[0], model)
             random_stats, rng_key = run_random_evaluation(
@@ -881,10 +893,11 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             )
 
             log = {
-                "eval/vs_baseline/avg_R": R_champ.mean().item(),
-                "eval/vs_baseline/win_rate": win_rate_champ,
-                "eval/vs_baseline/draw_rate": draw_rate_champ,
-                "eval/vs_baseline/lose_rate": lose_rate_champ,
+                "eval/vs_baseline/avg_R": float(np.mean(champion_results == 1) - np.mean(champion_results == -1)),
+                "eval/vs_baseline/win_rate": champion_wins / champion_results.size,
+                "eval/vs_baseline/draw_rate": champion_draws / champion_results.size,
+                "eval/vs_baseline/lose_rate": champion_losses / champion_results.size,
+                "eval/vs_baseline/score": champion_score,
                 "eval/vs_random/avg_R": random_stats["score"],
                 "eval/vs_random/win_rate": random_stats["win_rate"],
                 "eval/vs_random/draw_rate": random_stats["draw_rate"],
@@ -922,8 +935,15 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             #     log["eval/offline/legal_move_mass"] = float(jax.device_get(val_outputs["val_legal_move_mass"]))
             
             wandb.log(log)
-            log_str = ", ".join([f"{k}: {v}" for k, v in log.items()])
-            print(f"[EVAL UPDATE] {log_str}")
+            print(
+                f"RL Evaluation {iteration} | "
+                f"Baseline W/D/L {champion_wins}/{champion_draws}/{champion_losses} "
+                f"Score: {champion_score:.2%} | "
+                f"Random W/D/L {random_stats['wins']}/{random_stats['draws']}/{random_stats['losses']} "
+                f"Score: {random_stats['score']:.2%} "
+                f"(White: {random_stats['by_color']['white']['score']:.2%}, "
+                f"Black: {random_stats['by_color']['black']['score']:.2%})"
+            )
 
             next(data_loader)
             current_buffer_snapshot = data_loader.send("SAVE")
@@ -1004,22 +1024,31 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         loop_elapsed_time = time.time() - loop_start_time
         hours += loop_elapsed_time / 3600
 
+        policy_loss = sum(policy_losses) / len(policy_losses)
+        value_loss = sum(value_losses) / len(value_losses)
+        value_magnitude = sum(val_magnitudes) / len(val_magnitudes)
+        speed = int((len(minibatches) * config.training_batch_size) / (loop_elapsed_time + 1e-8))
         log = {
-            "iteration": iteration, 
-            "hours": hours, 
+            "iteration": iteration,
+            "hours": hours,
             "frames": frames,
-            "train/policy_loss": sum(policy_losses) / len(policy_losses),
-            "train/value_loss": sum(value_losses) / len(value_losses),
-            "train/value_prediction_magnitude": sum(val_magnitudes) / len(val_magnitudes),
+            "train/policy_loss": policy_loss,
+            "train/value_loss": value_loss,
+            "train/value_prediction_magnitude": value_magnitude,
             "selfplay/avg_game_length": avg_game_length,
             "selfplay/search_confidence_max_visits": avg_max_visits,
             "selfplay/legal_moves_percentage": avg_legal_pct,
-            "speed/fps": int((len(minibatches) * config.training_batch_size) / (loop_elapsed_time + 1e-8)),
-            **buffer_metrics
+            "speed/fps": speed,
+            **buffer_metrics,
         }
         wandb.log(log)
-        log_str = ", ".join([f"{k}: {v}" for k, v in log.items()])
-        print(log_str)
+        print(
+            f"RL Iteration {iteration} Complete | Policy Loss: {policy_loss:.4f} | "
+            f"Value Loss: {value_loss:.4f} | Value Magnitude: {value_magnitude:.4f} | "
+            f"Avg Game Length: {avg_game_length:.2f} | FPS: {speed} | "
+            f"Replay: {buffer_metrics.get('replay_buffer/size', 0)}/"
+            f"{config.replay_buffer_capacity} | Hours: {hours:.2f}"
+        )
 
 
 def make_data_loader(config, num_devices):
