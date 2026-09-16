@@ -430,6 +430,30 @@ def evaluate_vs_random(rng_key, my_model, my_color):
     return R
 
 
+def summarize_evaluation(results, colors):
+    def summarize(selected_results):
+        wins = int(np.sum(selected_results == 1))
+        draws = int(np.sum(selected_results == 0))
+        losses = int(np.sum(selected_results == -1))
+        return {
+            "games": int(selected_results.size),
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "win_rate": wins / selected_results.size,
+            "draw_rate": draws / selected_results.size,
+            "loss_rate": losses / selected_results.size,
+            "score": (wins + 0.5 * draws) / selected_results.size,
+        }
+
+    stats = summarize(results)
+    stats["by_color"] = {
+        "white": summarize(results[colors == 0]),
+        "black": summarize(results[colors == 1]),
+    }
+    return stats
+
+
 def run_random_evaluation(rng_key, model, num_games):
     """Play balanced-color games against a uniform random legal opponent."""
     if config.eval_batch_size % num_devices != 0:
@@ -456,27 +480,35 @@ def run_random_evaluation(rng_key, model, num_games):
     results = np.concatenate(results)
     result_players = np.concatenate(result_players)
 
-    def summarize(selected_results):
-        wins = int(np.sum(selected_results == 1))
-        draws = int(np.sum(selected_results == 0))
-        losses = int(np.sum(selected_results == -1))
-        return {
-            "games": int(selected_results.size),
-            "wins": wins,
-            "draws": draws,
-            "losses": losses,
-            "win_rate": wins / selected_results.size,
-            "draw_rate": draws / selected_results.size,
-            "loss_rate": losses / selected_results.size,
-            "score": (wins + 0.5 * draws) / selected_results.size,
-        }
+    return summarize_evaluation(results, result_players), rng_key
 
-    stats = summarize(results)
-    stats["by_color"] = {
-        "white": summarize(results[result_players == 0]),
-        "black": summarize(results[result_players == 1]),
-    }
-    return stats, rng_key
+
+def run_baseline_evaluation(rng_key, model, baseline_model, num_games):
+    if config.eval_batch_size % num_devices != 0:
+        raise ValueError("eval_batch_size must be divisible by the number of devices")
+    if num_games % config.eval_batch_size != 0:
+        raise ValueError("num_games must be divisible by eval_batch_size")
+
+    local_batch_size = config.eval_batch_size // num_devices
+    sharded_model = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), model
+    )
+    sharded_baseline = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), baseline_model
+    )
+    results = []
+    result_colors = []
+    for start in range(0, num_games, config.eval_batch_size):
+        rng_key, eval_key = jax.random.split(rng_key)
+        keys = jax.random.split(eval_key, num_devices)
+        colors = np.arange(start, start + config.eval_batch_size, dtype=np.int32) % 2
+        colors = jax.device_put(colors.reshape(num_devices, local_batch_size))
+        result = evaluate(keys, sharded_model, sharded_baseline, colors)
+        results.append(np.asarray(jax.device_get(result)).reshape(-1))
+        result_colors.append(np.asarray(colors).reshape(-1))
+
+    del sharded_model, sharded_baseline
+    return summarize_evaluation(np.concatenate(results), np.concatenate(result_colors)), rng_key
 
 
 def report_random_evaluation(rng_key, model, num_games, label):
@@ -886,36 +918,27 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
 
     while True:
         if iteration % config.eval_interval == 0:
-            rng_key, eval_key = jax.random.split(rng_key)
-            keys = jax.random.split(eval_key, num_devices)
-            champion_model_sharded = jax.tree_util.tree_map(
-                lambda x: jax.device_put(jnp.stack([x] * num_devices), sharding), champion_model_cpu
-            )
-
-            eval_colors = np.arange(config.eval_batch_size, dtype=np.int32) % 2
-            eval_colors = jax.device_put(
-                eval_colors.reshape(num_devices, config.eval_batch_size // num_devices)
-            )
-            R_champ = evaluate(keys, model, champion_model_sharded, eval_colors)
-            del champion_model_sharded
-
-            champion_results = np.asarray(jax.device_get(R_champ)).reshape(-1)
-            champion_wins = int(np.sum(champion_results == 1))
-            champion_draws = int(np.sum(champion_results == 0))
-            champion_losses = int(np.sum(champion_results == -1))
-            champion_score = (champion_wins + 0.5 * champion_draws) / champion_results.size
-
             current_model_cpu = jax.tree_util.tree_map(lambda x: x[0], model)
+            rng_key, baseline_key, random_key = jax.random.split(rng_key, 3)
+            baseline_stats, _ = run_baseline_evaluation(
+                baseline_key,
+                jax.device_get(current_model_cpu),
+                champion_model_cpu,
+                config.eval_games,
+            )
             random_stats, rng_key = run_random_evaluation(
-                eval_key, jax.device_get(current_model_cpu), config.eval_games
+                random_key, jax.device_get(current_model_cpu), config.eval_games
             )
 
             log = {
-                "eval/vs_baseline/avg_R": float(np.mean(champion_results == 1) - np.mean(champion_results == -1)),
-                "eval/vs_baseline/win_rate": champion_wins / champion_results.size,
-                "eval/vs_baseline/draw_rate": champion_draws / champion_results.size,
-                "eval/vs_baseline/lose_rate": champion_losses / champion_results.size,
-                "eval/vs_baseline/score": champion_score,
+                "eval/vs_baseline/avg_R": baseline_stats["win_rate"] - baseline_stats["loss_rate"],
+                "eval/vs_baseline/win_rate": baseline_stats["win_rate"],
+                "eval/vs_baseline/draw_rate": baseline_stats["draw_rate"],
+                "eval/vs_baseline/lose_rate": baseline_stats["loss_rate"],
+                "eval/vs_baseline/score": baseline_stats["score"],
+                "eval/vs_baseline/games": baseline_stats["games"],
+                "eval/vs_baseline/white/score": baseline_stats["by_color"]["white"]["score"],
+                "eval/vs_baseline/black/score": baseline_stats["by_color"]["black"]["score"],
                 "eval/vs_random/avg_R": random_stats["score"],
                 "eval/vs_random/win_rate": random_stats["win_rate"],
                 "eval/vs_random/draw_rate": random_stats["draw_rate"],
@@ -955,8 +978,8 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             wandb.log(log)
             print(
                 f"RL Evaluation {iteration} | "
-                f"Baseline W/D/L {champion_wins}/{champion_draws}/{champion_losses} "
-                f"Score: {champion_score:.2%} | "
+                f"Baseline W/D/L {baseline_stats['wins']}/{baseline_stats['draws']}/{baseline_stats['losses']} "
+                f"Score: {baseline_stats['score']:.2%} | "
                 f"Random W/D/L {random_stats['wins']}/{random_stats['draws']}/{random_stats['losses']} "
                 f"Score: {random_stats['score']:.2%} "
                 f"(White: {random_stats['by_color']['white']['score']:.2%}, "
@@ -985,7 +1008,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "env_version": env.version,
             })
 
-            if win_rate_champ > 0.55:
+            if baseline_stats["win_rate"] > 0.55:
                 print(f"Model {chpt_0} dethroned the champion!")
                 champion_model_cpu = jax.device_get(model_0)
                 champion_path = os.path.join(ckpt_dir, "champion")
