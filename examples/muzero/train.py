@@ -1110,7 +1110,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         print(
             f"RL Iteration {iteration} Complete | Policy Loss: {policy_loss:.4f} | "
             f"Value Loss: {value_loss:.4f} | Value Magnitude: {value_magnitude:.4f} | "
-            f"Avg Game Length: {avg_game_length:.2f} | FPS: {speed} | "
+            f"Avg Game Length: {avg_game_length:.2f} | Self-play FPS: {selfplay_fps} | "
             f"Replay: {buffer_metrics.get('replay_buffer/size', 0)}/"
             f"{config.replay_buffer_capacity} | Hours: {hours:.2f}"
         )
