@@ -80,10 +80,12 @@ class Config(BaseModel):
     require_random_win: bool = True
     # eval params
     eval_interval: int = 10
-    eval_games: int = 512
+    eval_games: int = 256
     eval_batch_size: int = 8
+    eval_progress_interval: int = 8
+    eval_max_steps: int = 256
     eval_confidence_z: float = 1.96
-    promotion_eval_games: int = 1024
+    promotion_eval_games: int = 512
     promotion_eval_interval: int = 50
     rl_promotion_min_score: float = 0.55
     rl_regression_patience: int = 3
@@ -419,7 +421,7 @@ def evaluate(rng_key, my_model, baseline_model, my_color):
     my_player = state._player_order[jnp.arange(batch_size), my_color]
 
     def body_fn(val):
-        key, state, R = val
+        key, state, R, step = val
         key, my_key, opponent_key = jax.random.split(key, 3)
         my_action = search_action((my_model_params, my_model_state), my_key, state)
         opponent_action = search_action((base_model_params, base_model_state), opponent_key, state)
@@ -427,10 +429,12 @@ def evaluate(rng_key, my_model, baseline_model, my_color):
         action = jnp.where(is_my_turn, my_action, opponent_action)
         state = jax.vmap(env.step)(state, action)
         R = R + state.rewards[jnp.arange(batch_size), my_player]
-        return (key, state, R)
+        return (key, state, R, step + 1)
 
     _, _, R = jax.lax.while_loop(
-        lambda x: ~(x[1].terminated.all()), body_fn, (key, state, jnp.zeros(batch_size))
+        lambda x: jnp.logical_and(~x[1].terminated.all(), x[3] < config.eval_max_steps),
+        body_fn,
+        (key, state, jnp.zeros(batch_size), jnp.int32(0)),
     )
     return R
 
@@ -483,7 +487,7 @@ def evaluate_vs_random(rng_key, my_model, my_color):
     my_player = state._player_order[jnp.arange(batch_size), my_color]
 
     def body_fn(val):
-        key, state, R = val
+        key, state, R, step = val
         key, search_key, random_key = jax.random.split(key, 3)
         model_action = search_action_vs_random(
             (my_model_params, my_model_state), search_key, state, my_player
@@ -498,10 +502,12 @@ def evaluate_vs_random(rng_key, my_model, my_color):
         
         # Accumulate rewards from the perspective of my_player
         R = R + state.rewards[jnp.arange(batch_size), my_player]
-        return (key, state, R)
+        return (key, state, R, step + 1)
 
     _, _, R = jax.lax.while_loop(
-        lambda x: ~(x[1].terminated.all()), body_fn, (key, state, jnp.zeros(batch_size))
+        lambda x: jnp.logical_and(~x[1].terminated.all(), x[3] < config.eval_max_steps),
+        body_fn,
+        (key, state, jnp.zeros(batch_size), jnp.int32(0)),
     )
     return R
 
@@ -545,7 +551,7 @@ def make_evaluation_key(iteration):
     return jax.random.fold_in(jax.random.PRNGKey(config.seed + 1), iteration)
 
 
-def run_random_evaluation(rng_key, model, num_games):
+def run_random_evaluation(rng_key, model, num_games, progress_label="random"):
     """Play balanced-color games against a uniform random legal opponent."""
     if config.eval_batch_size % num_devices != 0:
         raise ValueError("eval_batch_size must be divisible by the number of devices")
@@ -566,6 +572,9 @@ def run_random_evaluation(rng_key, model, num_games):
         result = evaluate_vs_random(keys, sharded_model, colors)
         results.append(np.asarray(jax.device_get(result)).reshape(-1))
         result_players.append(np.asarray(colors).reshape(-1))
+        completed = start + config.eval_batch_size
+        if completed == num_games or completed // config.eval_batch_size % config.eval_progress_interval == 0:
+            print(f"Evaluation {progress_label}: {completed}/{num_games} games")
 
     del sharded_model
     results = np.concatenate(results)
@@ -574,7 +583,7 @@ def run_random_evaluation(rng_key, model, num_games):
     return summarize_evaluation(results, result_players), rng_key
 
 
-def run_baseline_evaluation(rng_key, model, baseline_model, num_games):
+def run_baseline_evaluation(rng_key, model, baseline_model, num_games, progress_label="baseline"):
     if config.eval_batch_size % num_devices != 0:
         raise ValueError("eval_batch_size must be divisible by the number of devices")
     if num_games % config.eval_batch_size != 0:
@@ -597,6 +606,9 @@ def run_baseline_evaluation(rng_key, model, baseline_model, num_games):
         result = evaluate(keys, sharded_model, sharded_baseline, colors)
         results.append(np.asarray(jax.device_get(result)).reshape(-1))
         result_colors.append(np.asarray(colors).reshape(-1))
+        completed = start + config.eval_batch_size
+        if completed == num_games or completed // config.eval_batch_size % config.eval_progress_interval == 0:
+            print(f"Evaluation {progress_label}: {completed}/{num_games} games")
 
     del sharded_model, sharded_baseline
     return summarize_evaluation(np.concatenate(results), np.concatenate(result_colors)), rng_key
@@ -1017,34 +1029,32 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             current_model_cpu = jax.tree_util.tree_map(lambda x: x[0], model)
             evaluation_key = make_evaluation_key(iteration)
             baseline_key, random_key = jax.random.split(evaluation_key)
-            baseline_stats, _ = run_baseline_evaluation(
-                baseline_key,
-                jax.device_get(current_model_cpu),
-                champion_model_cpu,
-                config.eval_games,
+            promotion_iteration = (
+                iteration > 0
+                and config.promotion_eval_games > config.eval_games
+                and iteration % config.promotion_eval_interval == 0
             )
+            evaluation_games = (
+                config.promotion_eval_games if promotion_iteration else config.eval_games
+            )
+            if iteration == 0:
+                baseline_colors = np.arange(evaluation_games, dtype=np.int32) % 2
+                baseline_stats = summarize_evaluation(
+                    np.zeros(evaluation_games, dtype=np.int8), baseline_colors
+                )
+            else:
+                baseline_stats, _ = run_baseline_evaluation(
+                    baseline_key,
+                    jax.device_get(current_model_cpu),
+                    champion_model_cpu,
+                    evaluation_games,
+                    "baseline",
+                )
             random_stats, _ = run_random_evaluation(
-                random_key, jax.device_get(current_model_cpu), config.eval_games
+                random_key, jax.device_get(current_model_cpu), evaluation_games, "random"
             )
             promotion_baseline_stats = baseline_stats
             promotion_random_stats = random_stats
-            if (
-                config.promotion_eval_games > config.eval_games
-                and iteration % config.promotion_eval_interval == 0
-            ):
-                promotion_key = jax.random.fold_in(evaluation_key, 1)
-                promotion_baseline_key, promotion_random_key = jax.random.split(promotion_key)
-                promotion_baseline_stats, _ = run_baseline_evaluation(
-                    promotion_baseline_key,
-                    jax.device_get(current_model_cpu),
-                    champion_model_cpu,
-                    config.promotion_eval_games,
-                )
-                promotion_random_stats, _ = run_random_evaluation(
-                    promotion_random_key,
-                    jax.device_get(current_model_cpu),
-                    config.promotion_eval_games,
-                )
             if random_stats["score"] > best_random_score + config.rl_regression_min_delta:
                 best_random_score = random_stats["score"]
                 best_random_iteration = iteration
@@ -1072,7 +1082,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "eval/vs_random/regression_wait": random_regression_wait,
                 "iteration": iteration, "frames": frames, "hours": hours
             }
-            if promotion_random_stats is not random_stats:
+            if promotion_iteration:
                 log.update({
                     "eval/promotion/games": promotion_random_stats["games"],
                     "eval/promotion/baseline_score": promotion_baseline_stats["score"],
@@ -1080,34 +1090,6 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                     "eval/promotion/random_score": promotion_random_stats["score"],
                     "eval/promotion/random_score_lower_bound": promotion_random_stats["score_lower_bound"],
                 })
-
-            # if has_validation_data:
-            #     # Extract a clean, single-device parameter slice from your multi-device model weights
-            #     model_params, model_state = model
-                
-            #     # Define a pure local forward function that does not close over sharded parameters
-            #     def batch_forward(obs):
-            #         (logits, _), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
-            #         return logits
-
-            #     # Reconstruct your validation data arrays without the leading device axis
-            #     flat_val_obs = val_obs.reshape(-1, *val_obs.shape[2:])
-            #     flat_val_masks = val_masks.reshape(-1, *val_masks.shape[2:])
-            #     flat_val_actions = val_actions.reshape(-1)
-
-            #     # FIX: Explicitly pass batch_forward as the first positional argument!
-            #     val_outputs = evaluate_offline_metrics(
-            #         batch_forward, 
-            #         flat_val_obs, 
-            #         flat_val_masks, 
-            #         flat_val_actions
-            #     )
-
-            #     # Pull the results back to the logging dictionary
-            #     log["eval/offline/top1_accuracy"] = float(jax.device_get(val_outputs["val_top_1_accuracy"]))
-            #     log["eval/offline/top5_accuracy"] = float(jax.device_get(val_outputs["val_top_5_accuracy"]))
-            #     log["eval/offline/policy_entropy"] = float(jax.device_get(val_outputs["val_policy_entropy"]))
-            #     log["eval/offline/legal_move_mass"] = float(jax.device_get(val_outputs["val_legal_move_mass"]))
             
             wandb.log(log)
             print(

@@ -41,8 +41,9 @@ RL evaluations now use deterministic MCTS with the configured simulation count,
 including uniform opponent priors during random-opponent search. They save the
 best random-opponent model as `best_random.ckpt`, report score confidence bounds,
 and stop after `rl_regression_patience` evaluations without improvement.
-Regular evaluations use `eval_games`; promotion checks use `promotion_eval_games`
-every `promotion_eval_interval` iterations. Regression stopping also writes
+Regular evaluations use `eval_games` with an `eval_max_steps` cap. Promotion
+iterations run only the larger `promotion_eval_games` evaluation, rather than
+running both evaluation sizes. Regression stopping also writes
 `final.ckpt` from the best checkpoint.
 Supervised training runs up to `supervised_epochs`, stopping when held-out loss
 fails to improve for `supervised_validation_patience` epochs and restoring the
