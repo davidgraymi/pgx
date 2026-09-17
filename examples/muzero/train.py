@@ -81,6 +81,8 @@ class Config(BaseModel):
     eval_interval: int = 10
     eval_games: int = 512
     eval_batch_size: int = 8
+    rl_regression_patience: int = 3
+    rl_regression_min_delta: float = 0.01
     replay_buffer_path: str | None = None
     model_config = ConfigDict(extra="forbid")
     champion: str | None = None
@@ -138,6 +140,25 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
         value=value,
     )
     return recurrent_fn_output, state
+
+
+def search_action(model, rng_key, state):
+    model_params, model_state = model
+    (logits, value), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+    policy_output = mctx.gumbel_muzero_policy(
+        params=model,
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=config.num_simulations,
+        invalid_actions=~state.legal_action_mask,
+        qtransform=mctx.qtransform_completed_by_mix_value,
+        gumbel_scale=1.0,
+    )
+    return jnp.argmax(policy_output.action_weights, axis=-1)
 
 
 class SelfplayOutput(NamedTuple):
@@ -323,23 +344,11 @@ def evaluate(rng_key, my_model, baseline_model, my_color):
 
     def body_fn(val):
         key, state, R = val
-        # Policy output for the active learning agent
-        (my_logits, _), _ = forward.apply(
-            my_model_params, my_model_state, state.observation, is_eval=True
-        )
-        # Policy output for the snapshot target baseline agent
-        (opp_logits, _), _ = forward.apply(
-            base_model_params, base_model_state, state.observation, is_eval=True
-        )
-        
-        is_my_turn = (state.current_player == my_player).reshape((-1, 1))
-        logits = jnp.where(is_my_turn, my_logits, opp_logits)
-        
-        # Mask out illegal moves during evaluation to keep games valid
-        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-        logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
-        
-        action = jnp.argmax(logits, axis=-1)
+        key, my_key, opponent_key = jax.random.split(key, 3)
+        my_action = search_action((my_model_params, my_model_state), my_key, state)
+        opponent_action = search_action((base_model_params, base_model_state), opponent_key, state)
+        is_my_turn = state.current_player == my_player
+        action = jnp.where(is_my_turn, my_action, opponent_action)
         state = jax.vmap(env.step)(state, action)
         R = R + state.rewards[jnp.arange(batch_size), my_player]
         return (key, state, R)
@@ -399,24 +408,13 @@ def evaluate_vs_random(rng_key, my_model, my_color):
 
     def body_fn(val):
         key, state, R = val
-        
-        # 1. Active Learning Agent Policy Pass
-        (my_logits, _), _ = forward.apply(
-            my_model_params, my_model_state, state.observation, is_eval=True
-        )
-        # Apply mask to your model's logits
-        my_logits = my_logits - jnp.max(my_logits, axis=-1, keepdims=True)
-        my_logits = jnp.where(state.legal_action_mask, my_logits, jnp.finfo(my_logits.dtype).min)
-        
-        # 2. Random Agent Policy Pass
+        key, search_key, random_key = jax.random.split(key, 3)
+        model_action = search_action((my_model_params, my_model_state), search_key, state)
         # We assign an equal logit value (0.0) to all moves, then mask out illegal ones.
         # This creates a uniform distribution over only legal actions.
         random_logits = jnp.where(state.legal_action_mask, 0.0, jnp.finfo(jnp.float32).min)
-        
         is_my_turn = state.current_player == my_player
-        model_action = jnp.argmax(my_logits, axis=-1)
-        key, subkey = jax.random.split(key)
-        random_action = jax.random.categorical(subkey, random_logits, axis=-1)
+        random_action = jax.random.categorical(random_key, random_logits, axis=-1)
         action = jnp.where(is_my_turn, model_action, random_action)
         state = jax.vmap(env.step)(state, action)
         
@@ -915,6 +913,9 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         save_replay_buffer(replay_buffer_path, data_loader.send("SAVE"))
 
     minibatches = warmup_batches
+    best_random_score = -np.inf
+    random_regression_wait = 0
+    best_random_iteration = 0
 
     while True:
         if iteration % config.eval_interval == 0:
@@ -929,6 +930,12 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             random_stats, rng_key = run_random_evaluation(
                 random_key, jax.device_get(current_model_cpu), config.eval_games
             )
+            if random_stats["score"] > best_random_score + config.rl_regression_min_delta:
+                best_random_score = random_stats["score"]
+                best_random_iteration = iteration
+                random_regression_wait = 0
+            else:
+                random_regression_wait += 1
 
             log = {
                 "eval/vs_baseline/avg_R": baseline_stats["win_rate"] - baseline_stats["loss_rate"],
@@ -944,6 +951,8 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "eval/vs_random/draw_rate": random_stats["draw_rate"],
                 "eval/vs_random/lose_rate": random_stats["loss_rate"],
                 "eval/vs_random/games": random_stats["games"],
+                "eval/vs_random/best_score": best_random_score,
+                "eval/vs_random/regression_wait": random_regression_wait,
                 "iteration": iteration, "frames": frames, "hours": hours
             }
 
@@ -1008,12 +1017,35 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "env_version": env.version,
             })
 
+            if iteration == best_random_iteration:
+                save_checkpoint(ckpt_dir, "best_random.ckpt", {
+                    "config": config,
+                    "rng_key": rng_key,
+                    "model": jax.device_get(model_0),
+                    "opt_state": jax.device_get(opt_state_0),
+                    "iteration": iteration,
+                    "frames": frames,
+                    "hours": hours,
+                    "replay_buffer_path": replay_buffer_path,
+                    "pgx.__version__": pgx.__version__,
+                    "env_id": env.id,
+                    "env_version": env.version,
+                })
+
             if baseline_stats["win_rate"] > 0.55:
                 print(f"Model {chpt_0} dethroned the champion!")
                 champion_model_cpu = jax.device_get(model_0)
                 champion_path = os.path.join(ckpt_dir, "champion")
                 with open(champion_path, "w", encoding="utf-8") as f:
                     f.write(chpt_0)
+
+            if random_regression_wait >= config.rl_regression_patience:
+                print(
+                    f"Random-opponent score failed to improve for "
+                    f"{config.rl_regression_patience} evaluations; "
+                    f"best score was {best_random_score:.2%} at iteration {best_random_iteration}."
+                )
+                break
 
         if iteration >= config.max_num_iters:
             break

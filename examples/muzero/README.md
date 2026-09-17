@@ -35,8 +35,11 @@ games against a uniform random player, and starts RL only when the score reaches
 `supervised_min_random_score`. Set `require_random_win=false` to bypass that gate.
 The pipeline reports the same random-opponent evaluation before and after
 supervised training for a direct comparison.
-Evaluation uses the model's highest-scoring legal move; only the random opponent
-samples moves.
+Evaluation uses deterministic MCTS with the configured simulation count; only the
+random opponent samples moves.
+RL evaluations now use deterministic MCTS with the configured simulation count,
+and save the best random-opponent model as `best_random.ckpt`. Training stops
+after `rl_regression_patience` evaluations without a meaningful score improvement.
 Supervised training runs up to `supervised_epochs`, stopping when held-out loss
 fails to improve for `supervised_validation_patience` epochs and restoring the
 best validation-loss model. Training entropy and accuracy are logged only.
