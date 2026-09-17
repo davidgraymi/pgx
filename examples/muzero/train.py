@@ -184,7 +184,7 @@ def search_action_vs_random(model, rng_key, state, my_player):
             next_state.legal_action_mask, 0.0, jnp.finfo(output.prior_logits.dtype).min
         )
         prior_logits = jnp.where(opponent_turn, random_prior, output.prior_logits)
-        return output._replace(prior_logits=prior_logits), next_state
+        return output.replace(prior_logits=prior_logits), next_state
 
     root = mctx.RootFnOutput(prior_logits=root_logits, value=value, embedding=state)
     policy_output = mctx.gumbel_muzero_policy(
