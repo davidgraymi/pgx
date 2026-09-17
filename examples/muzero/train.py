@@ -431,7 +431,7 @@ def evaluate(rng_key, my_model, baseline_model, my_color):
         R = R + state.rewards[jnp.arange(batch_size), my_player]
         return (key, state, R, step + 1)
 
-    _, _, R = jax.lax.while_loop(
+    _, _, R, _ = jax.lax.while_loop(
         lambda x: jnp.logical_and(~x[1].terminated.all(), x[3] < config.eval_max_steps),
         body_fn,
         (key, state, jnp.zeros(batch_size), jnp.int32(0)),
@@ -504,7 +504,7 @@ def evaluate_vs_random(rng_key, my_model, my_color):
         R = R + state.rewards[jnp.arange(batch_size), my_player]
         return (key, state, R, step + 1)
 
-    _, _, R = jax.lax.while_loop(
+    _, _, R, _ = jax.lax.while_loop(
         lambda x: jnp.logical_and(~x[1].terminated.all(), x[3] < config.eval_max_steps),
         body_fn,
         (key, state, jnp.zeros(batch_size), jnp.int32(0)),
