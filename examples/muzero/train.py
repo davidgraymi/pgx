@@ -64,6 +64,7 @@ class Config(BaseModel):
     # training params
     training_batch_size: int = 256
     learning_rate: float = 0.0003
+    replay_update_ratio: float = 1.0
     load_ckpt: str | None = None
     training_mode: str = "pipeline"
     sl_dataset_path: str = "data/sl_dataset.npz"
@@ -81,6 +82,10 @@ class Config(BaseModel):
     eval_interval: int = 10
     eval_games: int = 512
     eval_batch_size: int = 8
+    eval_confidence_z: float = 1.96
+    promotion_eval_games: int = 1024
+    promotion_eval_interval: int = 50
+    rl_promotion_min_score: float = 0.55
     rl_regression_patience: int = 3
     rl_regression_min_delta: float = 0.01
     replay_buffer_path: str | None = None
@@ -153,6 +158,38 @@ def search_action(model, rng_key, state):
         rng_key=rng_key,
         root=root,
         recurrent_fn=recurrent_fn,
+        num_simulations=config.num_simulations,
+        invalid_actions=~state.legal_action_mask,
+        qtransform=mctx.qtransform_completed_by_mix_value,
+        gumbel_scale=1.0,
+    )
+    return jnp.argmax(policy_output.action_weights, axis=-1)
+
+
+def search_action_vs_random(model, rng_key, state, my_player):
+    model_params, model_state = model
+    (logits, value), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    model_logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    random_logits = jnp.where(state.legal_action_mask, 0.0, jnp.finfo(logits.dtype).min)
+    model_turn = (state.current_player == my_player).reshape((-1, 1))
+    root_logits = jnp.where(model_turn, model_logits, random_logits)
+
+    def recurrent_vs_random(search_model, search_key, action, search_state):
+        output, next_state = recurrent_fn(search_model, search_key, action, search_state)
+        opponent_turn = (next_state.current_player != my_player).reshape((-1, 1))
+        random_prior = jnp.where(
+            next_state.legal_action_mask, 0.0, jnp.finfo(output.prior_logits.dtype).min
+        )
+        prior_logits = jnp.where(opponent_turn, random_prior, output.prior_logits)
+        return output._replace(prior_logits=prior_logits), next_state
+
+    root = mctx.RootFnOutput(prior_logits=root_logits, value=value, embedding=state)
+    policy_output = mctx.gumbel_muzero_policy(
+        params=model,
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_vs_random,
         num_simulations=config.num_simulations,
         invalid_actions=~state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
@@ -313,21 +350,60 @@ def loss_fn(model_params, model_state, samples: Sample):
     value_loss = jnp.mean(value_loss * samples.mask)
 
     avg_pred_value_magnitude = jnp.mean(jnp.abs(value))
+    policy_target_entropy = -jnp.mean(
+        jnp.sum(samples.policy_tgt * jnp.log(samples.policy_tgt + 1e-8), axis=-1)
+    )
+    value_target_mean = jnp.mean(samples.value_tgt)
+    value_target_std = jnp.std(samples.value_tgt)
+    value_pred_centered = value - jnp.mean(value)
+    value_target_centered = samples.value_tgt - jnp.mean(samples.value_tgt)
+    value_correlation = jnp.sum(value_pred_centered * value_target_centered)
+    value_correlation /= (
+        jnp.sqrt(jnp.sum(value_pred_centered**2) * jnp.sum(value_target_centered**2)) + 1e-8
+    )
 
-    return policy_loss + value_loss, (model_state, policy_loss, value_loss, avg_pred_value_magnitude)
+    return policy_loss + value_loss, (
+        model_state,
+        policy_loss,
+        value_loss,
+        avg_pred_value_magnitude,
+        policy_target_entropy,
+        value_target_mean,
+        value_target_std,
+        value_correlation,
+    )
 
 
 @partial(jax.pmap, axis_name="i")
 def train(model, opt_state, data: Sample):
     model_params, model_state = model
-    grads, (model_state, policy_loss, value_loss, val_magnitude) = jax.grad(loss_fn, has_aux=True)(
+    grads, (
+        model_state,
+        policy_loss,
+        value_loss,
+        val_magnitude,
+        policy_target_entropy,
+        value_target_mean,
+        value_target_std,
+        value_correlation,
+    ) = jax.grad(loss_fn, has_aux=True)(
         model_params, model_state, data
     )
     grads = jax.lax.pmean(grads, axis_name="i")
     updates, opt_state = optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
     model = (model_params, model_state)
-    return model, opt_state, policy_loss, value_loss, val_magnitude
+    return (
+        model,
+        opt_state,
+        policy_loss,
+        value_loss,
+        val_magnitude,
+        policy_target_entropy,
+        value_target_mean,
+        value_target_std,
+        value_correlation,
+    )
 
 
 @jax.pmap
@@ -409,7 +485,9 @@ def evaluate_vs_random(rng_key, my_model, my_color):
     def body_fn(val):
         key, state, R = val
         key, search_key, random_key = jax.random.split(key, 3)
-        model_action = search_action((my_model_params, my_model_state), search_key, state)
+        model_action = search_action_vs_random(
+            (my_model_params, my_model_state), search_key, state, my_player
+        )
         # We assign an equal logit value (0.0) to all moves, then mask out illegal ones.
         # This creates a uniform distribution over only legal actions.
         random_logits = jnp.where(state.legal_action_mask, 0.0, jnp.finfo(jnp.float32).min)
@@ -445,11 +523,26 @@ def summarize_evaluation(results, colors):
         }
 
     stats = summarize(results)
+    second_moment = (stats["wins"] + 0.25 * stats["draws"]) / stats["games"]
+    score_variance = max(0.0, second_moment - stats["score"] ** 2)
+    stats["score_lower_bound"] = stats["score"] - config.eval_confidence_z * np.sqrt(
+        score_variance / stats["games"]
+    )
     stats["by_color"] = {
         "white": summarize(results[colors == 0]),
         "black": summarize(results[colors == 1]),
     }
+    for color_stats in stats["by_color"].values():
+        second_moment = (color_stats["wins"] + 0.25 * color_stats["draws"]) / color_stats["games"]
+        score_variance = max(0.0, second_moment - color_stats["score"] ** 2)
+        color_stats["score_lower_bound"] = color_stats["score"] - config.eval_confidence_z * np.sqrt(
+            score_variance / color_stats["games"]
+        )
     return stats
+
+
+def make_evaluation_key(iteration):
+    return jax.random.fold_in(jax.random.PRNGKey(config.seed + 1), iteration)
 
 
 def run_random_evaluation(rng_key, model, num_games):
@@ -517,6 +610,7 @@ def report_random_evaluation(rng_key, model, num_games, label):
         f"{label}/draw_rate": stats["draw_rate"],
         f"{label}/loss_rate": stats["loss_rate"],
         f"{label}/score": stats["score"],
+        f"{label}/score_lower_bound": stats["score_lower_bound"],
         f"{label}/white/score": stats["by_color"]["white"]["score"],
         f"{label}/black/score": stats["by_color"]["black"]["score"],
     })
@@ -913,6 +1007,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         save_replay_buffer(replay_buffer_path, data_loader.send("SAVE"))
 
     minibatches = warmup_batches
+    device_minibatches = [jax.device_put(batch) for batch in minibatches]
     best_random_score = -np.inf
     random_regression_wait = 0
     best_random_iteration = 0
@@ -920,16 +1015,36 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
     while True:
         if iteration % config.eval_interval == 0:
             current_model_cpu = jax.tree_util.tree_map(lambda x: x[0], model)
-            rng_key, baseline_key, random_key = jax.random.split(rng_key, 3)
+            evaluation_key = make_evaluation_key(iteration)
+            baseline_key, random_key = jax.random.split(evaluation_key)
             baseline_stats, _ = run_baseline_evaluation(
                 baseline_key,
                 jax.device_get(current_model_cpu),
                 champion_model_cpu,
                 config.eval_games,
             )
-            random_stats, rng_key = run_random_evaluation(
+            random_stats, _ = run_random_evaluation(
                 random_key, jax.device_get(current_model_cpu), config.eval_games
             )
+            promotion_baseline_stats = baseline_stats
+            promotion_random_stats = random_stats
+            if (
+                config.promotion_eval_games > config.eval_games
+                and iteration % config.promotion_eval_interval == 0
+            ):
+                promotion_key = jax.random.fold_in(evaluation_key, 1)
+                promotion_baseline_key, promotion_random_key = jax.random.split(promotion_key)
+                promotion_baseline_stats, _ = run_baseline_evaluation(
+                    promotion_baseline_key,
+                    jax.device_get(current_model_cpu),
+                    champion_model_cpu,
+                    config.promotion_eval_games,
+                )
+                promotion_random_stats, _ = run_random_evaluation(
+                    promotion_random_key,
+                    jax.device_get(current_model_cpu),
+                    config.promotion_eval_games,
+                )
             if random_stats["score"] > best_random_score + config.rl_regression_min_delta:
                 best_random_score = random_stats["score"]
                 best_random_iteration = iteration
@@ -943,6 +1058,7 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "eval/vs_baseline/draw_rate": baseline_stats["draw_rate"],
                 "eval/vs_baseline/lose_rate": baseline_stats["loss_rate"],
                 "eval/vs_baseline/score": baseline_stats["score"],
+                "eval/vs_baseline/score_lower_bound": baseline_stats["score_lower_bound"],
                 "eval/vs_baseline/games": baseline_stats["games"],
                 "eval/vs_baseline/white/score": baseline_stats["by_color"]["white"]["score"],
                 "eval/vs_baseline/black/score": baseline_stats["by_color"]["black"]["score"],
@@ -951,10 +1067,19 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                 "eval/vs_random/draw_rate": random_stats["draw_rate"],
                 "eval/vs_random/lose_rate": random_stats["loss_rate"],
                 "eval/vs_random/games": random_stats["games"],
+                "eval/vs_random/score_lower_bound": random_stats["score_lower_bound"],
                 "eval/vs_random/best_score": best_random_score,
                 "eval/vs_random/regression_wait": random_regression_wait,
                 "iteration": iteration, "frames": frames, "hours": hours
             }
+            if promotion_random_stats is not random_stats:
+                log.update({
+                    "eval/promotion/games": promotion_random_stats["games"],
+                    "eval/promotion/baseline_score": promotion_baseline_stats["score"],
+                    "eval/promotion/baseline_score_lower_bound": promotion_baseline_stats["score_lower_bound"],
+                    "eval/promotion/random_score": promotion_random_stats["score"],
+                    "eval/promotion/random_score_lower_bound": promotion_random_stats["score_lower_bound"],
+                })
 
             # if has_validation_data:
             #     # Extract a clean, single-device parameter slice from your multi-device model weights
@@ -988,9 +1113,9 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             print(
                 f"RL Evaluation {iteration} | "
                 f"Baseline W/D/L {baseline_stats['wins']}/{baseline_stats['draws']}/{baseline_stats['losses']} "
-                f"Score: {baseline_stats['score']:.2%} | "
+                f"Score: {baseline_stats['score']:.2%} (LB: {baseline_stats['score_lower_bound']:.2%}) | "
                 f"Random W/D/L {random_stats['wins']}/{random_stats['draws']}/{random_stats['losses']} "
-                f"Score: {random_stats['score']:.2%} "
+                f"Score: {random_stats['score']:.2%} (LB: {random_stats['score_lower_bound']:.2%}) "
                 f"(White: {random_stats['by_color']['white']['score']:.2%}, "
                 f"Black: {random_stats['by_color']['black']['score']:.2%})"
             )
@@ -1032,7 +1157,10 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                     "env_version": env.version,
                 })
 
-            if baseline_stats["win_rate"] > 0.55:
+            if (
+                promotion_baseline_stats["score"] >= config.rl_promotion_min_score
+                and promotion_baseline_stats["score_lower_bound"] > 0.5
+            ):
                 print(f"Model {chpt_0} dethroned the champion!")
                 champion_model_cpu = jax.device_get(model_0)
                 champion_path = os.path.join(ckpt_dir, "champion")
@@ -1045,6 +1173,12 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
                     f"{config.rl_regression_patience} evaluations; "
                     f"best score was {best_random_score:.2%} at iteration {best_random_iteration}."
                 )
+                best_path = os.path.join(ckpt_dir, "best_random.ckpt")
+                if os.path.exists(best_path):
+                    with open(best_path, "rb") as f:
+                        best_checkpoint = pickle.load(f)
+                    save_checkpoint(ckpt_dir, "final.ckpt", best_checkpoint)
+                    print(f"Restored best RL checkpoint to {os.path.join(ckpt_dir, 'final.ckpt')}.")
                 break
 
         if iteration >= config.max_num_iters:
@@ -1053,13 +1187,28 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         loop_start_time = time.time()
         training_start_time = loop_start_time
         policy_losses, value_losses, val_magnitudes = [], [], []
-        sharded_minibatches = [jax.device_put(b) for b in minibatches]
+        target_entropies, target_means, target_stds, value_correlations = [], [], [], []
+        sharded_minibatches = device_minibatches
 
         for minibatch in sharded_minibatches:
-            model, opt_state, policy_loss, value_loss, v_mag = train(model, opt_state, minibatch)
+            (
+                model,
+                opt_state,
+                policy_loss,
+                value_loss,
+                v_mag,
+                target_entropy,
+                target_mean,
+                target_std,
+                value_correlation,
+            ) = train(model, opt_state, minibatch)
             policy_losses.append(policy_loss.mean().item())
             value_losses.append(value_loss.mean().item())
             val_magnitudes.append(v_mag.mean().item())
+            target_entropies.append(target_entropy.mean().item())
+            target_means.append(target_mean.mean().item())
+            target_stds.append(target_std.mean().item())
+            value_correlations.append(value_correlation.mean().item())
 
         training_elapsed_time = time.time() - training_start_time
 
@@ -1107,6 +1256,8 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             next(data_loader)
             minibatches, buffer_metrics = data_loader.send(samples)
 
+        device_minibatches = [jax.device_put(batch) for batch in minibatches]
+
         loop_elapsed_time = time.time() - loop_start_time
         selfplay_elapsed_time = time.time() - selfplay_start_time
         hours += loop_elapsed_time / 3600
@@ -1116,6 +1267,10 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         policy_loss = sum(policy_losses) / len(policy_losses)
         value_loss = sum(value_losses) / len(value_losses)
         value_magnitude = sum(val_magnitudes) / len(val_magnitudes)
+        target_entropy = sum(target_entropies) / len(target_entropies)
+        target_mean = sum(target_means) / len(target_means)
+        target_std = sum(target_stds) / len(target_stds)
+        value_correlation = sum(value_correlations) / len(value_correlations)
         updates_completed = len(sharded_minibatches)
         selfplay_fps = int(selfplay_frames / (selfplay_elapsed_time + 1e-8))
         train_fps = int((updates_completed * config.training_batch_size) / (training_elapsed_time + 1e-8))
@@ -1127,6 +1282,10 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             "train/policy_loss": policy_loss,
             "train/value_loss": value_loss,
             "train/value_prediction_magnitude": value_magnitude,
+            "train/policy_target_entropy": target_entropy,
+            "train/value_target_mean": target_mean,
+            "train/value_target_std": target_std,
+            "train/value_target_correlation": value_correlation,
             "train/updates": updates_completed,
             "selfplay/avg_game_length": avg_game_length,
             "selfplay/search_confidence_max_visits": avg_max_visits,
@@ -1239,7 +1398,9 @@ def make_data_loader(config, num_devices):
         }
 
         num_fresh_frames = valid_obs.shape[0]
-        num_updates = num_fresh_frames // config.training_batch_size
+        num_updates = int(
+            num_fresh_frames / config.training_batch_size * config.replay_update_ratio
+        )
         total_required_elements = num_updates * config.training_batch_size
         if num_updates == 0 or buffer_size < max(total_required_elements, config.training_batch_size * 2):
             yield None, buffer_metrics
@@ -1262,6 +1423,8 @@ def make_data_loader(config, num_devices):
             for i in range(num_updates)
         ]
         buffer_metrics["replay_buffer/sample_age_mean"] = float(np.mean(sample_ages))
+        buffer_metrics["replay_buffer/sample_age_p50"] = float(np.percentile(sample_ages, 50))
+        buffer_metrics["replay_buffer/sample_age_p90"] = float(np.percentile(sample_ages, 90))
         buffer_metrics["replay_buffer/sample_age_max"] = int(np.max(sample_ages))
         yield batches_list, buffer_metrics
 
@@ -1360,7 +1523,7 @@ if __name__ == "__main__":
         print(f"Resuming pipeline from iteration tracker index: {iteration}")
 
     if config.training_mode == "pipeline":
-        evaluation_key = rng_key
+        evaluation_key = make_evaluation_key(0)
         report_random_evaluation(
             evaluation_key, model, config.supervised_eval_games, "supervised_eval/before"
         )

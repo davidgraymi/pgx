@@ -38,8 +38,12 @@ supervised training for a direct comparison.
 Evaluation uses deterministic MCTS with the configured simulation count; only the
 random opponent samples moves.
 RL evaluations now use deterministic MCTS with the configured simulation count,
-and save the best random-opponent model as `best_random.ckpt`. Training stops
-after `rl_regression_patience` evaluations without a meaningful score improvement.
+including uniform opponent priors during random-opponent search. They save the
+best random-opponent model as `best_random.ckpt`, report score confidence bounds,
+and stop after `rl_regression_patience` evaluations without improvement.
+Regular evaluations use `eval_games`; promotion checks use `promotion_eval_games`
+every `promotion_eval_interval` iterations. Regression stopping also writes
+`final.ckpt` from the best checkpoint.
 Supervised training runs up to `supervised_epochs`, stopping when held-out loss
 fails to improve for `supervised_validation_patience` epochs and restoring the
 best validation-loss model. Training entropy and accuracy are logged only.
@@ -54,6 +58,8 @@ RL uses a 50,000-position ring buffer, samples it without copying the whole
 buffer, and bootstraps value targets for rollouts that reach the step limit.
 W&B also records separate self-play, training, and whole-loop FPS, termination
 and truncation rates, value-target statistics, update counts, and replay-sample age.
+RL batches are prefetched to devices, and `replay_update_ratio` controls how many
+updates are made per newly collected batch.
 
 Useful resource controls:
 
