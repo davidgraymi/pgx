@@ -37,6 +37,9 @@ The pipeline reports the same random-opponent evaluation before and after
 supervised training for a direct comparison.
 Evaluation uses deterministic MCTS with the configured simulation count; only the
 random opponent samples moves.
+Training uses `num_simulations=64` by default, while fast evaluation uses
+`eval_num_simulations=16`. Champion comparisons retain the full
+`num_simulations` depth.
 RL evaluations now use deterministic MCTS with the configured simulation count,
 including uniform opponent priors during random-opponent search. They save the
 best random-opponent model as `best_random.ckpt`, report score confidence bounds,

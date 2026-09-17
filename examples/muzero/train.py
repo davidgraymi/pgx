@@ -58,6 +58,7 @@ class Config(BaseModel):
     # selfplay params
     selfplay_batch_size: int = 16
     num_simulations: int = 64
+    eval_num_simulations: int = 16
     max_num_steps: int = 256
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
@@ -81,7 +82,7 @@ class Config(BaseModel):
     # eval params
     eval_interval: int = 10
     eval_games: int = 256
-    eval_batch_size: int = 8
+    eval_batch_size: int = 64
     eval_progress_interval: int = 8
     eval_max_steps: int = 256
     eval_confidence_z: float = 1.96
@@ -192,7 +193,7 @@ def search_action_vs_random(model, rng_key, state, my_player):
         rng_key=rng_key,
         root=root,
         recurrent_fn=recurrent_vs_random,
-        num_simulations=config.num_simulations,
+        num_simulations=config.eval_num_simulations,
         invalid_actions=~state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
         gumbel_scale=1.0,
@@ -895,39 +896,6 @@ def run_supervised_training(config, model, opt_state, num_devices, sharding, ckp
 
 def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, iteration, frames, hours, rng_key, buffer_state, replay_buffer_path):
     """Executes the core MuZero RL continuum using dynamic history sampling."""
-    # sl_dataset_path = os.path.join("data", "sl_dataset.pkl")
-    # has_validation_data = os.path.exists(sl_dataset_path)
-    # val_obs, val_actions, val_masks = None, None, None
-
-    # if has_validation_data:
-    #     print("\n=== Loading Offline Lichess Dataset for Periodic Validation ===")
-    #     with open(sl_dataset_path, "rb") as f:
-    #         val_dataset = pickle.load(f)
-        
-    #     # Take a fixed subset (e.g., 2048 positions) to keep evaluation extremely fast
-    #     val_subset_size = min(2048, val_dataset["observations"].shape[0])
-        
-    #     # We need legal move masks for the offline metrics function. 
-    #     # We can extract them by mapping env.init or evaluating the current state, 
-    #     # but since pgx observations don't store the raw mask explicitly, we can generate 
-    #     # a dummy array or filter our batch. For offline mapping against human targets,
-    #     # we can pass an all-True mask or a structural mask if available.
-    #     # Let's create an all-True fallback mask if the dataset doesn't have it.
-    #     val_obs = np.asarray(val_dataset["observations"][:val_subset_size])
-    #     val_actions = np.asarray(val_dataset["actions"][:val_subset_size])
-        
-    #     # Shape: (val_subset_size, 4672) matching pgx.chess action space
-    #     val_masks = np.ones((val_subset_size, env.num_actions), dtype=bool) 
-        
-    #     # Reshape data structures cleanly to shard across your PMAP devices
-    #     val_obs = val_obs.reshape(num_devices, val_subset_size // num_devices, *val_obs.shape[1:])
-    #     val_actions = val_actions.reshape(num_devices, val_subset_size // num_devices)
-    #     val_masks = val_masks.reshape(num_devices, val_subset_size // num_devices, env.num_actions)
-        
-    #     print(f"Loaded {val_subset_size} offline validation positions successfully.")
-    # else:
-    #     print("\n[Warning] sl_dataset.pkl not found. Offline metric tracking will be skipped.")
-
     # Load a champion
     champion_model_cpu = jax.device_get(model)
     if config.champion is not None and os.path.exists(config.champion):
