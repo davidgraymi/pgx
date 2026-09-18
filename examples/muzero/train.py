@@ -55,11 +55,16 @@ class Config(BaseModel):
     num_channels: int = 64
     num_layers: int = 4
     resnet_v2: bool = True
-    # selfplay params
-    selfplay_batch_size: int = 16
+    # Self-play is the dominant cost in RL.  A larger batch gives the accelerator
+    # more independent games to process, but also increases the MCTS tree and
+    # environment-state memory footprint.  Keep this divisible by num_devices.
+    selfplay_batch_size: int = 24
     num_simulations: int = 64
     eval_num_simulations: int = 16
-    max_num_steps: int = 256
+    # Pgx games normally finish before 192 moves.  The rollout mask keeps the
+    # first episode per lane, so a larger cap can spend MCTS work on transitions
+    # that are later discarded.  Increase this again if W&B reports truncation.
+    max_num_steps: int = 192
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
     # training params
@@ -80,8 +85,8 @@ class Config(BaseModel):
     supervised_min_random_score: float = 0.55
     require_random_win: bool = True
     # eval params
-    eval_interval: int = 10
-    eval_games: int = 256
+    eval_interval: int = 20
+    eval_games: int = 64
     eval_batch_size: int = 64
     eval_progress_interval: int = 8
     eval_max_steps: int = 256
@@ -211,6 +216,9 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     max_visits: jnp.ndarray
     legal_pct: jnp.ndarray
+    # True for scan steps that actually ran batched MCTS; false for static
+    # padding emitted after every original game lane has finished.
+    executed: jnp.ndarray
 
 
 @jax.pmap
@@ -263,9 +271,13 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
-        (_, bootstrap_value), _ = forward.apply(
-            model_params, model_state, state.observation, is_eval=True
-        )
+
+        # Bootstrap is only consumed for the final transition of the scan (see
+        # compute_loss_input below).  Computing it here on every step adds a
+        # second network evaluation to every rollout step, even though all but
+        # the final result are thrown away.  Store a placeholder during the
+        # scan and fill the final entry once after the scan completes.
+        bootstrap_value = jnp.zeros_like(value)
         discount = -1.0 * jnp.ones_like(value)
         discount = jnp.where(state.terminated, 0.0, discount)
         
@@ -278,15 +290,78 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             bootstrap_value=bootstrap_value,
             discount=discount,
             max_visits=max_root_visits,
-            legal_pct=legal_percentage
+            legal_pct=legal_percentage,
+            executed=jnp.asarray(True),
         )
 
-    # Run selfplay for max_num_steps by batch
+    def scan_step(carry, key):
+        """Advance the original game batch, padding after every lane is done.
+
+        The scan keeps a static output shape because replay-target computation
+        expects ``max_num_steps`` entries.  ``auto_reset`` is still used while
+        some lanes are active so terminal states are safe for the batched Pgx
+        step function, but ``episode_done`` remembers the first episode's
+        terminal signal.  Once all lanes have finished, the conditional selects
+        a cheap padding branch instead of running another MCTS search.  The
+        padded entries are marked terminal and are therefore ignored by
+        ``compute_loss_input``.
+        """
+        state, episode_done = carry
+
+        def run_step(operand):
+            state, episode_done, key = operand
+            next_state, output = step_fn(state, key)
+            next_episode_done = episode_done | output.terminated | output.truncated
+            return (next_state, next_episode_done), output
+
+        def pad_step(operand):
+            state, episode_done, _ = operand
+            reward = jnp.zeros_like(state.rewards[:, 0])
+            output = SelfplayOutput(
+                obs=jnp.zeros_like(state.observation),
+                reward=reward,
+                terminated=episode_done,
+                truncated=jnp.zeros_like(episode_done),
+                bootstrap_value=jnp.zeros_like(reward),
+                action_weights=jnp.zeros_like(
+                    state.legal_action_mask, dtype=jnp.float32
+                ),
+                discount=jnp.zeros_like(reward),
+                max_visits=jnp.zeros_like(state.current_player),
+                legal_pct=jnp.zeros_like(reward),
+                executed=jnp.asarray(False),
+            )
+            return (state, episode_done), output
+
+        return jax.lax.cond(
+            jnp.all(episode_done),
+            pad_step,
+            run_step,
+            (state, episode_done, key),
+        )
+
+    # Run self-play for max_num_steps by batch.  The scan remains statically
+    # sized for JAX, but MCTS is skipped as soon as every original game lane
+    # has terminated or truncated.
     rng_key, sub_key = jax.random.split(rng_key)
     keys = jax.random.split(sub_key, batch_size)
     state = jax.vmap(env.init)(keys)
     key_seq = jax.random.split(rng_key, config.max_num_steps)
-    _, data = jax.lax.scan(step_fn, state, key_seq)
+    episode_done = jnp.zeros((batch_size,), dtype=jnp.bool_)
+    (final_state, _), data = jax.lax.scan(
+        scan_step, (state, episode_done), key_seq
+    )
+
+    # Only games that reach the rollout limit need this value.  For a terminal
+    # final transition compute_loss_input replaces it with zero, so doing this
+    # single batched inference is sufficient for both terminal and truncated
+    # rollouts.
+    (_, bootstrap_value), _ = forward.apply(
+        model_params, model_state, final_state.observation, is_eval=True
+    )
+    data = data._replace(
+        bootstrap_value=data.bootstrap_value.at[-1].set(bootstrap_value)
+    )
 
     return data
 
@@ -331,14 +406,34 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
 def rollout_metrics(data: SelfplayOutput, samples: Sample):
     terminated = np.asarray(jax.device_get(data.terminated))
     truncated = np.asarray(jax.device_get(data.truncated))
+    executed = np.asarray(jax.device_get(data.executed), dtype=bool)
+    executed_mask = np.broadcast_to(executed[..., None], terminated.shape)
     mask = np.asarray(jax.device_get(samples.mask))
     value_targets = np.asarray(jax.device_get(samples.value_tgt))[mask]
+    executed_steps = int(executed_mask.sum())
     return {
-        "selfplay/termination_rate": float(terminated.mean()),
-        "selfplay/truncation_rate": float(truncated.mean()),
+        "selfplay/termination_rate": (
+            float(terminated[executed_mask].mean()) if executed_steps else 0.0
+        ),
+        "selfplay/truncation_rate": (
+            float(truncated[executed_mask].mean()) if executed_steps else 0.0
+        ),
         "value_target/mean": float(value_targets.mean()) if value_targets.size else 0.0,
         "value_target/std": float(value_targets.std()) if value_targets.size else 0.0,
     }
+
+
+def rollout_event_counts(data: SelfplayOutput):
+    """Count executed transitions while excluding static post-rollout padding."""
+    terminated = np.asarray(jax.device_get(data.terminated))
+    truncated = np.asarray(jax.device_get(data.truncated))
+    executed = np.asarray(jax.device_get(data.executed), dtype=bool)
+    executed_mask = np.broadcast_to(executed[..., None], terminated.shape)
+    return (
+        int(terminated[executed_mask].sum()),
+        int(truncated[executed_mask].sum()),
+        int(executed_mask.sum()),
+    )
 
 
 def loss_fn(model_params, model_state, samples: Sample):
@@ -948,7 +1043,9 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         samples = compute_loss_input(data)
 
         # Track frames experienced during warmup
-        steps_per_game = jax.device_get(samples.mask.sum(axis=2))
+        # samples.mask has shape [device, time, game].  Sum over time so each
+        # remaining value represents one complete game's valid trajectory.
+        steps_per_game = jax.device_get(samples.mask.sum(axis=1))
         avg_game_length = float(steps_per_game.mean())
         frames += int(steps_per_game.sum())
         rollout_log = rollout_metrics(data, samples)
@@ -975,7 +1072,10 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             "hours": hours,
             "frames": frames,
             "selfplay/avg_game_length": avg_game_length,
-            "speed/fps": 0,
+            "speed/fps": 0.0,
+            "speed/rollout_fps": 0.0,
+            "speed/selfplay_fps": 0.0,
+            "speed/replay_fps": 0.0,
             **rollout_log,
             **buffer_metrics
         })
@@ -1178,13 +1278,14 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         avg_max_visits = float(jax.device_get(gpu_avg_max_visits))
         avg_legal_pct = float(jax.device_get(gpu_avg_legal_pct))
 
-        steps_per_game = samples.mask.sum(axis=2)
+        # samples.mask has shape [device, time, game].  Summing over axis 1
+        # gives one length per game; summing over all entries gives positions.
+        steps_per_game = np.asarray(samples.mask.sum(axis=1))
+        game_lengths = [steps_per_game.reshape(-1)]
         avg_game_length = float(steps_per_game.mean())
         selfplay_frames = int(steps_per_game.sum())
         frames += selfplay_frames
-        rollout_terminated = int(np.asarray(jax.device_get(data.terminated)).sum())
-        rollout_truncated = int(np.asarray(jax.device_get(data.truncated)).sum())
-        rollout_steps = int(np.asarray(jax.device_get(data.terminated)).size)
+        rollout_terminated, rollout_truncated, rollout_steps = rollout_event_counts(data)
         rollout_log = rollout_metrics(data, samples)
 
         next(data_loader)
@@ -1197,16 +1298,22 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             keys = jax.random.split(subkey, num_devices)
             data: SelfplayOutput = selfplay(model, keys)
             samples = compute_loss_input(data)
-            steps_per_game = jax.device_get(samples.mask.sum(axis=2))
+            steps_per_game = np.asarray(jax.device_get(samples.mask.sum(axis=1)))
+            game_lengths.append(steps_per_game.reshape(-1))
             selfplay_frames += int(steps_per_game.sum())
             frames += int(steps_per_game.sum())
-            rollout_terminated += int(np.asarray(jax.device_get(data.terminated)).sum())
-            rollout_truncated += int(np.asarray(jax.device_get(data.truncated)).sum())
-            rollout_steps += int(np.asarray(jax.device_get(data.terminated)).size)
+            extra_terminated, extra_truncated, extra_steps = rollout_event_counts(data)
+            rollout_terminated += extra_terminated
+            rollout_truncated += extra_truncated
+            rollout_steps += extra_steps
             next(data_loader)
             minibatches, buffer_metrics = data_loader.send(samples)
 
         device_minibatches = [jax.device_put(batch) for batch in minibatches]
+
+        # Include fallback rollouts in the reported mean when the loader needed
+        # more than one self-play batch to produce a training batch.
+        avg_game_length = float(np.concatenate(game_lengths).mean())
 
         loop_elapsed_time = time.time() - loop_start_time
         selfplay_elapsed_time = time.time() - selfplay_start_time
@@ -1222,9 +1329,18 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         target_std = sum(target_stds) / len(target_stds)
         value_correlation = sum(value_correlations) / len(value_correlations)
         updates_completed = len(sharded_minibatches)
-        selfplay_fps = int(selfplay_frames / (selfplay_elapsed_time + 1e-8))
-        train_fps = int((updates_completed * config.training_batch_size) / (training_elapsed_time + 1e-8))
-        loop_fps = int(selfplay_frames / (loop_elapsed_time + 1e-8))
+        # Keep raw compute throughput separate from valid replay throughput.
+        # ``rollout_steps`` counts transitions for which batched MCTS actually
+        # ran, including lanes that were still being processed after another
+        # lane ended.  ``selfplay_frames`` only counts valid first-episode
+        # positions admitted to replay, so it naturally falls for shorter games.
+        rollout_fps = float(rollout_steps / (selfplay_elapsed_time + 1e-8))
+        replay_fps = float(selfplay_frames / (selfplay_elapsed_time + 1e-8))
+        train_fps = float(
+            (updates_completed * config.training_batch_size)
+            / (training_elapsed_time + 1e-8)
+        )
+        loop_fps = float(selfplay_frames / (loop_elapsed_time + 1e-8))
         log = {
             "iteration": iteration,
             "hours": hours,
@@ -1240,10 +1356,16 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
             "selfplay/avg_game_length": avg_game_length,
             "selfplay/search_confidence_max_visits": avg_max_visits,
             "selfplay/legal_moves_percentage": avg_legal_pct,
-            "speed/fps": selfplay_fps,
-            "speed/selfplay_fps": selfplay_fps,
+            # Primary FPS is actual executed rollout throughput, not replay
+            # sample yield.  Keep replay_fps available for data-generation
+            # efficiency and learning-positions-per-second comparisons.
+            "speed/fps": rollout_fps,
+            "speed/rollout_fps": rollout_fps,
+            "speed/selfplay_fps": rollout_fps,
+            "speed/replay_fps": replay_fps,
             "speed/train_fps": train_fps,
             "speed/loop_fps": loop_fps,
+            "speed/loop_replay_fps": loop_fps,
             **rollout_log,
             **buffer_metrics,
         }
@@ -1251,7 +1373,8 @@ def run_rl_training(config, model, opt_state, num_devices, sharding, ckpt_dir, i
         print(
             f"RL Iteration {iteration} Complete | Policy Loss: {policy_loss:.4f} | "
             f"Value Loss: {value_loss:.4f} | Value Magnitude: {value_magnitude:.4f} | "
-            f"Avg Game Length: {avg_game_length:.2f} | Self-play FPS: {selfplay_fps} | "
+            f"Avg Game Length: {avg_game_length:.2f} | "
+            f"Self-play FPS: {rollout_fps:.2f} | Replay FPS: {replay_fps:.2f} | "
             f"Replay: {buffer_metrics.get('replay_buffer/size', 0)}/"
             f"{config.replay_buffer_capacity} | Hours: {hours:.2f}"
         )

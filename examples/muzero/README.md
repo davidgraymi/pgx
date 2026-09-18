@@ -28,8 +28,13 @@ If an older compiled dataset contains fewer positions, `data.py` rebuilds it.
 While scanning, it overwrites `data/sl_dataset.npz` every 1,000,000 positions
 and after each month. Each save reports retained games, month coverage, action
 coverage, and action entropy, so an interrupted run still leaves a usable dataset.
-The default chess run uses a smaller network, eight self-play games per batch,
-64 search simulations, and a 50,000-position host replay buffer for a 6 GB GPU.
+The default chess run uses a smaller network, 24 self-play games per batch,
+64 search simulations, a 192-step rollout cap, and a 50,000-position host
+replay buffer for a 6 GB GPU. The larger self-play batch improves accelerator
+occupancy, while the rollout keeps a static tensor shape but short-circuits
+MCTS once all original game lanes have ended. Padding after that point is
+masked from replay targets. If `selfplay/truncation_rate` becomes nonzero,
+increase `max_num_steps` again before trading away long games.
 `training_mode=pipeline` first trains on `data/sl_dataset.npz`, plays 512 balanced
 games against a uniform random player, and starts RL only when the score reaches
 `supervised_min_random_score`. Set `require_random_win=false` to bypass that gate.
@@ -60,8 +65,16 @@ once as `replay_buffer.pkl` beside the checkpoints and overwritten in place;
 override it with `replay_buffer_path=...` when resuming a run.
 RL uses a 50,000-position ring buffer, samples it without copying the whole
 buffer, and bootstraps value targets for rollouts that reach the step limit.
-W&B also records separate self-play, training, and whole-loop FPS, termination
-and truncation rates, value-target statistics, update counts, and replay-sample age.
+Bootstrap values are evaluated once for the final rollout state rather than
+once per step; only that final value is used when computing targets. Keep
+`selfplay_batch_size` divisible by the number of JAX devices, and lower it if
+the larger MCTS batch exhausts GPU memory.
+W&B reports floating-point `speed/rollout_fps` (the actual executed batched
+rollout transitions per second) separately from `speed/replay_fps` (valid
+first-episode positions admitted to replay per second). The latter changes with
+game length; use the former to compare compute speed. It also records training
+and whole-loop FPS, termination and truncation rates, value-target statistics,
+update counts, and replay-sample age.
 RL batches are prefetched to devices, and `replay_update_ratio` controls how many
 updates are made per newly collected batch.
 
