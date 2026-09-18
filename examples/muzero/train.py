@@ -327,7 +327,9 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
                     state.legal_action_mask, dtype=jnp.float32
                 ),
                 discount=jnp.zeros_like(reward),
-                max_visits=jnp.zeros_like(state.current_player),
+                # Mctx returns visit summaries as float32 on the active branch;
+                # match that dtype so lax.cond sees identical branch trees.
+                max_visits=jnp.zeros_like(reward),
                 legal_pct=jnp.zeros_like(reward),
                 executed=jnp.asarray(False),
             )
